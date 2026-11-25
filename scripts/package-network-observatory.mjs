@@ -58,7 +58,7 @@ for (const [archivePath, diskPath] of files) {
   const content = archivePath === "README.md"
     ? Buffer.from(file.toString("utf8").replace(/\]\(\.\.\/([^)]+)\)/g, (_, relativePath) => {
         const view = /\.(?:jpg|png|webp)$/.test(relativePath) ? "raw" : "blob";
-        return `](${manifest.url}/${view}/${runnerRelease.releaseTag}/${relativePath})`;
+        return `](${manifest.url}/${view}/main/${relativePath})`;
       }))
     : file;
   const compressed = zlib.deflateRawSync(content, { level: 9 });

@@ -118,8 +118,9 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           notes=".github/release-notes/$tag.md"
+          theme_version=$(node -p "require('./komari-theme.json').version")
           assets=(
-            "komari-theme-blackwhite-$tag.zip"
+            "komari-theme-blackwhite-v$theme_version.zip"
             Blackwhite-Network-Observatory-v*.zip
             Blackwhite-Network-Observatory-v*.zip.sha256
             Blackwhite-Network-Observatory-latest.zip
@@ -131,7 +132,7 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --clobber
           elif [[ -f "$notes" ]]; then
-            gh release create "$tag" "${assets[@]}" --verify-tag --title "komari-theme-blackwhite $tag" --notes-file "$notes"
+            gh release create "$tag" "${assets[@]}" --verify-tag --title "komari-theme-blackwhite v$theme_version" --notes-file "$notes"
           else
             gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes
           fi

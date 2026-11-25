@@ -12,7 +12,7 @@
 
 ## 1. 安装面板插件
 
-1. 在 [Release v1.0.0](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/tag/v1.0.0) 的 Assets 下载 **`Blackwhite-Network-Observatory-v1.0.0.zip`**。也可以下载同名 `.sha256`，在两份文件同一目录用 `sha256sum -c Blackwhite-Network-Observatory-v1.0.0.zip.sha256` 核验。
+1. 在 [Release v1.0.0](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) 的 Assets 下载 **`Blackwhite-Network-Observatory-v1.0.0.zip`**。也可以下载同名 `.sha256`，在两份文件同一目录用 `sha256sum -c Blackwhite-Network-Observatory-v1.0.0.zip.sha256` 核验。
 2. 登录 Komari 管理后台，进入 **插件 → 插件管理**，上传完整 ZIP。安装后打开插件的启用开关，检查权限内容并授权。
 3. 插件声明 Node 兼容运行环境、自定义 API 路由及系统 RPC 权限，其中系统 RPC 用于读取节点清单与管理员信息，检测由独立探测器本地执行。启用后确认插件状态为运行中，再回到主题的 **Blackwhite 工作室 → 网络观测**。
 4. 正式面板应使用探测器能够访问且证书有效的 **HTTPS** 地址。若使用反向代理，将面板页面和 `/api/blackwhite-network-observatory/` 一并转发到 Komari。确保 VPS 能访问该面板、GitHub 发布页与所选检测目标。
@@ -45,7 +45,7 @@ rc-status default
 如果想查看安装脚本后再执行，可先把它保存到文件。将下列地址与 UUID 换成面板提供的值，密钥仍在交互提示中输入。
 
 ```sh
-release=https://github.com/imperatorwuming/komari-theme-blackwhite/releases/download/v1.0.0
+release=https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest/download
 curl -fSLO "$release/Blackwhite-Network-Observatory-install.sh"
 curl -fSLO "$release/Blackwhite-Network-Observatory-install.sh.sha256"
 sha256sum -c Blackwhite-Network-Observatory-install.sh.sha256

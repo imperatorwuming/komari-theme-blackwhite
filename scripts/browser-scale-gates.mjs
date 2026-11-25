@@ -1058,9 +1058,9 @@ try {
       await waitUntil(cdp, `document.querySelector(${JSON.stringify(selector)}) !== null`, 10000);
     };
     const select = (scope, label) => cdp.value(`[...document.querySelectorAll(${JSON.stringify(scope)})].find(el=>el.textContent.includes(${JSON.stringify(label)})).click()`);
-    const shot = async (name, selector) => {
+    const shot = async (name, selector, block = "start") => {
       if (selector) {
-        await cdp.value(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:"start"})`);
+        await cdp.value(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:${JSON.stringify(block)}})`);
       }
       await cdp.value("document.fonts.ready.then(()=>true)");
       await new Promise(resolve => setTimeout(resolve, 550));
@@ -1092,7 +1092,7 @@ try {
     await shot("probe", "#network-agents");
     await open(network + "&panel=targets", "#network-targets .network-form");
     await shot("targets", "#network-targets");
-    await shot("measurement-point", ".measurement-points-panel");
+    await shot("measurement-point", ".measurement-probes", "center");
     await open(network + "&panel=plans&nodes=node-0", ".report-plan-steps");
     await select(".report-preset-grid button", "TcpQuality 完整检测");
     await shot("plan-modules", ".report-plan-module");

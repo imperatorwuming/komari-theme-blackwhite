@@ -1,0 +1,2142 @@
+import { auroraNames, auroraNodes, auroraStatus, auroraStats, auroraSeries, auroraRoutes, auroraSpeeds } from "./network-card-fixture.mjs";
+import { checkCrystal } from "./crystal-browser-gates.mjs";
+import { checkReportExports } from "./report-export-browser-gates.mjs";
+import { createRequire } from "node:module";
+import { createServer } from "node:http";
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { extname, join, normalize } from "node:path";
+import { spawn, execFileSync } from "node:child_process";
+
+const originalNodeArchive = execFileSync("python3", ["-c", "import io,zipfile,base64\nb=io.BytesIO()\nwith zipfile.ZipFile(b,'w',compression=8) as z:\n z.writestr('header_info.log','### NodeQuality UPSTREAM_ONLY ###\\n')\n z.writestr('hardware_quality.log','\\x1b[41;97m硬件质量报告\\x1b[0m\\nCPU AMD EPYC\\n内存 1024 MB')\n z.writestr('ip_quality.log','\\x1b[32mIP 质量正常\\x1b[0m\\nIPv4: 203.0.113.19')\n z.writestr('net_quality.log','\\x1b[43;30m网络质量报告\\x1b[0m\\n'+'\\n'.join('UPSTREAM-ROW-%d'%i for i in range(150)))\n z.writestr('backroute_trace.log','上游回程路由\\nEND_OF_UPSTREAM')\n z.writestr('net_quality.json','{\"Head\":{\"IP\":\"null\"}}')\nprint(base64.b64encode(b.getvalue()).decode())"], {encoding:"utf8"}).trim();
+
+const ROOT = new URL("../dist/", import.meta.url).pathname;
+const chromeCandidates = [
+  process.env.CHROME_BIN,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  "/usr/bin/google-chrome",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+].filter(Boolean);
+const chrome = chromeCandidates.find((candidate) => existsSync(candidate));
+if (!chrome) throw new Error("Chrome/Chromium is required for browser scale gates");
+
+const mime = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".woff2": "font/woff2",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".jpg": "image/jpeg",
+  ".ico": "image/x-icon",
+};
+const BACKEND_PROFILES = Object.freeze({
+  legacy: Object.freeze({
+    id: "fork-rpc-v2.4",
+    label: "fork RPC v2.4",
+  }),
+  official: Object.freeze({
+    id: "official-komari-v1.4.3",
+    label: "official Komari 1.4.3",
+  }),
+});
+
+// `rpc.discover` is intentionally not listed here: upstream rejects that
+// probe with -32601 so the client can negotiate `rpc.methods`. The calls
+// below, by contrast, must never be made after a profile has been selected.
+const LEGACY_ONLY_RPC_METHODS = [
+  "common:getRealtimeDelta",
+  "common:getPingOverview",
+  "common:getRecords",
+];
+const OFFICIAL_ONLY_RPC_METHODS = [
+  "rpc.methods",
+  "common:getNodesLatestStatus",
+  "public:getPublicPingTasks",
+  "public:queryMetrics",
+  "public:getPingMetricStats",
+];
+// The 1,800-request soak intentionally exercises the long-poll lifecycle,
+// not a local-machine speed benchmark. GitHub hosted runners can take much
+// longer than a desktop to schedule every React/network turn, so give the
+// same workload a portable completion window instead of weakening the check.
+const SOAK_TICK_TARGET = 1_800;
+const SOAK_TIMEOUT_MS = 60_000;
+// Startup is separate from the render/soak budgets. Hosted Linux runners may
+// emit harmless DBus diagnostics and take several seconds before Chromium
+// writes its DevTools endpoint, so wait for the actual endpoint rather than
+// interpreting stderr as a startup signal.
+// Cold hosted runners can need more than 30s to expose the first blank tab.
+// This allowance is separate from, and does not relax, the UI render budgets.
+const DEVTOOLS_STARTUP_TIMEOUT_MS = process.env.CI === "true" ? 60_000 : 30_000;
+
+let activeFixture = {
+  backend: BACKEND_PROFILES.legacy.id,
+  nodes: 30,
+  soak: false,
+  run: "startup",
+  docs: false,
+};
+const requestCounts = new Map();
+const requestPayloads = new Map();
+let savedUiSettings = null;
+let rejectNextStudioSave = false;
+let studioSaveBarrier = null;
+const pointFixture = { probes: [], registeredNodes: [], updatePolicies: {} };
+let homeRouteNodes = [];
+let homeRouteDisplay = true;
+let homeSpeedNodes = [], homeSpeedDisplay = true;
+let homeRouteLabelMode = 'preferred', homeRouteShowDetails = false, homeSpeedShowDetails = false;
+const cardRuns = new Map();
+let cardSerial = 0;
+const cardFamilies = fixture => Object.fromEntries(nodeList(fixture.nodes).map(n => [n.uuid,['4','6']]));
+const cardStamp = (node,module,family) => [...cardRuns.values()].find(r=>r.nodeUuid===node&&r.module===module&&r.family===family&&r.phase==='finished')?.completedAt;
+function cardProjection(value, stamp) {
+  if (!stamp) return value;
+  if (Array.isArray(value)) return value.map(row=>({...row,forward:row.forward?{...row.forward,at:stamp}:null,return:row.return?{...row.return,at:stamp}:null}));
+  return {...value,at:stamp};
+}
+const reportRequire = createRequire(import.meta.url);
+const { ENDPOINTS: reportEndpoints, PRESETS: reportPresets, VERSION: reportCatalogVersion } = reportRequire('../network-observatory/plugin/src/report-catalog.js');
+const reportCapabilities = {schema:3,features:['rounds','latency-samples','full-mtr','speed-intervals','bgp-rpki','home-diagnostics','home-diagnostic-display','home-ip-capability','home-ip-capability-default','suite-history'],modules:['routes','tcp-quality','tcpquality-full','nodequality-full','china-speed','international','idc','international-speed','bgp','ip-quality','media-unlock'],maxTargetsPerRound:250,retention:{detailDays:7,summaryDays:90}};
+let reportSavedSuite = null;
+let reportPlanRuns = [];
+const reportRoundData = Object.fromEntries(reportCapabilities.modules.map(module => {
+ const config={module,preset:reportPresets.find(p=>p.module===module).id,endpoints:[],family:'4',protocols:['tcp','icmp'],sources:[],publicSources:true,seconds:10,warmupSeconds:2,streams:[1,4],enabled:true,timing:{type:'interval',minutes:30},nextAt:Date.now()+60000};
+ if (module === 'ip-quality' || module === 'media-unlock') {
+   const at = new Date().toISOString();
+   const slots = ['4','6'].map(family=>({id:module+family,jobId:'job-'+family,target:'localhost',direction:'VPS 公网出口',source:{provider:'runner'},endpoint:null,options:{family},state:family==='4'?'ok':'failed',missingReason:''}));
+   const streaming = {
+     services: { Netflix: {status:'unlocked',region:'US',mode:'dns'}, ChatGPT: {status:'unlocked',region:'US',mode:'native'} },
+     mediaEvidence: { ChatGPT: {ipQuality:{status:'unlocked',region:'US',mode:'native'},regionRestriction:{status:'unknown'}} },
+   };
+   const quality = {providers:{IPinfo:{usage:'isp'},IP2Location:{company:'hosting'}},riskScores:{Scamalytics:'63'},dbIpScore:'0'};
+   const measurements = slots.map(slot=>({id:slot.jobId,roundId:'round-'+module,slotId:slot.id,nodeUuid:'node-0',target:slot.target,direction:slot.direction,operation:module,pairId:'',executor:'node:node-0',source:slot.source,options:slot.options,startedAt:at,completedAt:at,
+     data:{kind:module,state:slot.state,...(slot.state==='failed'?{diagnostic:'该地址族没有返回可识别的检测结果'}:module==='ip-quality'?quality:streaming)}}));
+   return [module,{schema:3,id:'round-'+module,nodeUuid:'node-0',module,suiteId:'suite-fixture',plannedAt:at,startedAt:at,completedAt:at,state:'partial',counts:{expected:2,completed:2,ok:1,partial:0,failed:1,missing:0,cancelled:0},detailAvailable:true,parameters:{...config,family:'auto'},catalogVersion:reportCatalogVersion,slots,measurements}];
+ }
+ if (module === 'nodequality-full') {
+   const at = new Date().toISOString(), slot={id:module,jobId:'job-nodequality',target:'localhost',direction:'VPS→NodeQuality 测点',source:{provider:'runner'},endpoint:null,options:{},state:'ok',missingReason:''};
+   return [module,{schema:3,id:'round-'+module,nodeUuid:'node-0',module,suiteId:'suite-fixture',plannedAt:at,startedAt:at,completedAt:at,state:'complete',counts:{expected:1,completed:1,ok:1,partial:0,failed:0,missing:0,cancelled:0},detailAvailable:true,parameters:{...config,family:'auto'},catalogVersion:reportCatalogVersion,slots:[slot],measurements:[{id:'job-nodequality',roundId:'round-'+module,slotId:slot.id,nodeUuid:'node-0',target:'localhost',direction:slot.direction,operation:module,pairId:'',executor:'node:node-0',source:slot.source,options:{},startedAt:at,completedAt:at,data:{kind:module,state:'ok',family:'auto',reportUrl:'https://nodequality.com/r/fixture',sections:{'ip_quality.json':'{"ipv4":{"risk_score":12,"latency_ms":24,"provider":"Fixture Cloud"},"streaming":{"available":true}}','ip_quality.log':'\u001b[32mIP 质量检测\u001b[0m\nIPv4: 203.0.113.19\n网络质量：正常\n','net_quality.log':'\u001b]0;terminal title\u0007\u001b]8;;https://example.com\u001b\\\u001b[36m网络质量检测\u001b[0m\n电信 24 ms\n联通 31 ms\n移动 19 ms\u0000\u0008\u000b\ud800'},cleanLog:'NodeQuality 执行完成'}}]}];
+ }
+ if (module === 'tcpquality-full') {
+   const at = new Date().toISOString(), slot={id:'tcpquality-full',jobId:'job-full',target:'localhost',direction:'VPS→TcpQuality 测点',source:{provider:'runner'},endpoint:null,options:{},state:'partial',missingReason:''};
+   return [module,{schema:3,id:'round-'+module,nodeUuid:'node-0',module,suiteId:'suite-fixture',plannedAt:at,startedAt:at,completedAt:at,state:'partial',counts:{expected:1,completed:1,ok:0,partial:1,failed:0,missing:0,cancelled:0},detailAvailable:true,parameters:{...config,profile:'LOWMEM',timeoutMinutes:120},catalogVersion:reportCatalogVersion,slots:[slot],measurements:[{id:'job-full',roundId:'round-'+module,slotId:slot.id,nodeUuid:'node-0',target:'localhost',direction:slot.direction,operation:module,pairId:'',executor:'node:node-0',source:slot.source,options:{},startedAt:at,completedAt:at,data:{kind:module,state:'partial',profile:'LOWMEM',diagnostic:'在线报告上传失败；已保留 CSV',reportUrl:'https://tcpquality.ibsgss.uk/r/fixture',cleanLog:'TcpQuality 测试报告示例',csv:'测点,运营商,地区,状态,平均延迟ms,丢包率(%)\n上海,电信,中国,OK,24,0\n北京,联通,中国,OK,31,0\n广州,移动,中国,FAIL,180,12',coverage:{state:'partial',ok:4,failed:1,skipped:2,unknown:0,total:7,ipv4:'available',ipv6:'unavailable',sections:[{name:'回程',ok:4,failed:1,skipped:2,unknown:0,total:7}]}}}]}];
+ }
+ const selected=module==='international'?reportEndpoints.filter(e=>['aws','websites','cdn','telegram'].includes(e.category)&&e.family!=='6'):module==='idc'?reportEndpoints.filter(e=>e.category==='idc'):(module==='routes'||module==='tcp-quality')?reportEndpoints.filter(e=>e.category==='china-route'&&e.family==='4').slice(0,9):module==='bgp'?[reportEndpoints[0]]:reportEndpoints.filter(e=>e.category==='speed').slice(0,module==='china-speed'?9:10);
+ const slots=selected.map((e,i)=>({id:e.id,jobId:'job-'+i,target:e.address,direction:module==='routes'?'VPS→大陆':'VPS↔端点',source:{provider:e.provider,city:module==='china-speed'?['北京','上海','广州'][Math.floor(i/3)]:e.city||'北京',carrier:module==='china-speed'?['电信','联通','移动'][i%3]:e.carrier||'电信'},endpoint:e,options:{protocol:'tcp',port:e.port},state:i===1?'missing':'ok',missingReason:i===1?'此地区尚未配置授权端点':'',metrics:{medianMs:20+i}}));
+ const measurements=slots.map((slot,i)=>({id:slot.jobId,roundId:'round-'+module,slotId:slot.id,nodeUuid:'node-0',target:slot.target,direction:slot.direction,operation:module==='routes'?'route':module.endsWith('speed')?'benchmark':'latency',pairId:'',executor:'node:node-0',source:slot.source,options:slot.options,startedAt:new Date().toISOString(),completedAt:new Date().toISOString(),data:i===1?{kind:module.endsWith('speed')?'speed':'latency',state:'missing',diagnostic:slot.missingReason}:module==='routes'?{kind:'route',state:'ok',hops:[]}:module.endsWith('speed')?{kind:'speed',state:'ok',runs:[1,4].flatMap(streams=>['source-to-target','target-to-source'].map((direction,i)=>({direction,streams,state:'ok',bitsPerSecond:(i?650:420)*1e6,bytes:(i?650:420)*1e6/8*10,seconds:10,retransmits:i?12:4,diagnostic:'',vpsDirection:i?'upload':'download',tcpRttMs:25,maxBitsPerSecond:(i?650:420)*1.2e6,trafficBytesObserved:(i?650:420)*1e6/8*10,intervals:Array.from({length:10},(_,n)=>({start:n,end:n+1,seconds:1,bytes:1e6,bitsPerSecond:400e6}))})))}:module==='bgp'?{kind:'bgp',state:'ok',prefix:'8.8.8.0/24',originAsns:['15169'],coveringPrefixes:[],queriedAt:new Date().toISOString(),cacheHit:false,sources:[{source:'RIPE RIS',state:'ok',url:'https://stat.ripe.net/',collectors:['rrc00'],peers:['8.8.8.8'],retainedPaths:1,returnedPaths:1,truncated:false,diagnostic:'fixture',dataTime:new Date().toISOString()}],paths:[{id:'ris:0',source:'RIPE RIS',prefix:'8.8.8.0/24',collector:'rrc00',peer:'8.8.8.8',peerAsn:'3356',path:['3356','15169'],observedAt:new Date().toISOString(),routeUpdatedAt:null,communities:[]}],graph:{nodes:[{id:'3356',origin:false,kind:'asn'},{id:'15169',origin:true,kind:'asn'}],edges:[{id:'3356>15169',from:'3356',to:'15169',pathIds:['ris:0']}]},rpki:[{asn:'15169',state:'valid',validator:'RIPEstat',queriedAt:new Date().toISOString()}],changes:{baseline:true,comparableSources:[],addedPaths:[],removedPaths:[],addedAdjacentAsns:[],removedAdjacentAsns:[],coverageChanged:false}}:{kind:'latency',state:'ok',method:'TCP connect',tcpQuality:{method:'TCP connect',address:'8.8.8.8',state:'partial',sent:10,received:9,failurePercent:10,avgMs:20+i,medianMs:20+i,minMs:18,maxMs:50,stdevMs:1,samples:Array.from({length:10},(_,n)=>({index:n+1,state:n===9?'timeout':'ok',rttMs:n===9?null:20+i+n,address:'8.8.8.8',error:n===9?'Timed out':''}))},https:{state:'application',httpStatus:403,tlsVerified:true}}}));
+ return [module,{schema:3,id:'round-'+module,nodeUuid:'node-0',module,suiteId:'suite-fixture',batchId:'batch-fixture',plannedAt:new Date().toISOString(),startedAt:new Date().toISOString(),completedAt:new Date().toISOString(),state:'partial',counts:{expected:slots.length,completed:slots.length,ok:slots.length-1,partial:0,failed:0,missing:1,cancelled:0},detailAvailable:true,parameters:config,catalogVersion:reportCatalogVersion,slots,measurements}];
+}));
+
+function fixtureReportRound(module, prior = false) {
+  const round = structuredClone(reportRoundData[module]);
+  if (!round || !activeFixture.comprehensive) return round;
+  const at = new Date(Date.now() - (prior ? 65 : 5) * 60000).toISOString();
+  if (prior) round.id += '-older';
+  round.plannedAt = round.startedAt = round.completedAt = at;
+  for (const measurement of round.measurements) {
+    measurement.roundId = round.id; measurement.startedAt = measurement.completedAt = at;
+    if (module === 'routes' && measurement.data.state === 'ok') measurement.data.routeEvidence = { headlineLabels: prior ? ['163'] : ['163', 'CN2'] };
+    if (prior && Array.isArray(measurement.data.runs)) for (const run of measurement.data.runs) run.bitsPerSecond /= 2;
+  }
+  return round;
+}
+
+// Real preset → normalized measurements → round storage → private projection.
+const routeFixtureRoot = mkdtempSync(join(tmpdir(), 'blackwhite-browser-routes-'));
+const routePipeline = await reportRequire('../network-observatory/plugin/tests/carrier-route-fixture.cjs').carrierFixture(routeFixtureRoot);
+const projectedRouteFamilies = (await routePipeline.invoke('GET', '/home-routes')).body.nodes[routePipeline.A];
+const speedPipeline = await reportRequire('../network-observatory/plugin/tests/carrier-speed-fixture.cjs').speedFixture(routeFixtureRoot);
+const speedPipeline6 = await reportRequire('../network-observatory/plugin/tests/carrier-speed-fixture.cjs').speedFixture(routeFixtureRoot, true, undefined, '6');
+const projectedSpeeds = (await speedPipeline6.invoke('GET', '/home-speeds?families=1')).body.nodes[speedPipeline.A];
+const projectedSpeed = projectedSpeeds['4'];
+reportRoundData.routes = { ...routePipeline.round, nodeUuid: 'node-0' };
+// Exercise metadata loss regressions through the real report parser and UI.
+for (const measurement of reportRoundData.routes.measurements) {
+  if (measurement.direction !== 'VPS→大陆' || !measurement.data.hops?.length) continue;
+  const first = measurement.data.hops[0];
+  Object.assign(first, {network:'中国电信 · CN2',location:'中国 · 上海',whois:'CN2-BackBone',domain:'chinatelecom.com.cn',geoSource:'NextTrace / NextTrace-API'});
+  measurement.data.metadataObservation = {method:'nexttrace',state:'ok',matchedIps:[first.address],exitCode:0,protocol:'tcp',port:443,
+    resolvedIp:measurement.target,completedAt:new Date().toISOString(),durationMs:1200,complete:false,
+    hops:[{...first,rttMs:120}],stdout:'NextTrace fixture output',stderr:''};
+}
+rmSync(routeFixtureRoot, { recursive: true, force: true });
+// Report date inputs have minute precision; keep fixture evidence safely before the frozen end.
+const measuredAt = new Date(Date.now() - 5 * 60000).toISOString();
+for (const round of Object.values(reportRoundData)) {
+  round.startedAt = round.completedAt = round.plannedAt = measuredAt;
+  for (const measurement of round.measurements) { measurement.nodeUuid = round.nodeUuid; measurement.startedAt = measurement.completedAt = measuredAt; }
+}
+
+function count(label, run = activeFixture.run) {
+  const counts = requestCounts.get(run) ?? {};
+  counts[label] = (counts[label] ?? 0) + 1;
+  requestCounts.set(run, counts);
+}
+
+function recordRpcRequest(run, method, params) {
+  count(`rpc:${method}`, run);
+  const requests = requestPayloads.get(run) ?? [];
+  requests.push({ method, params });
+  requestPayloads.set(run, requests);
+}
+
+function isOfficialFixture(fixture) {
+  return fixture.backend === BACKEND_PROFILES.official.id;
+}
+
+function fixturePingTaskNames(fixture) {
+  if (fixture.crystal) return [...auroraNames, "内网 IPv4", "机房网关", "广州电信·跨境链路-LongProbeName"];
+  if (fixture.aurora) return auroraNames;
+  if (fixture.luminousReference) return ["电信", "联通", "移动", "电信V6", "联通V6", "移动V6"];
+  return Array.from({ length: 6 }, (_, index) => `Task ${index + 1}`);
+}
+
+function nodeList(size) {
+  if (activeFixture.aurora) return auroraNodes(size, activeFixture.crystal).map(node => (
+    node.uuid === 'node-0' && activeFixture.crystalLongName ? {...node, name: activeFixture.crystalLongName} : node));
+  const docsNames = [
+    ["洛杉矶 Edge", "北美", "US", "Vultr"],
+    ["东京 Core", "亚太", "JP", "Linode"],
+    ["法兰克福 Relay", "欧洲", "DE", "Hetzner"],
+    ["新加坡 Gateway", "亚太", "SG", "DigitalOcean"],
+    ["香港 Transit", "中国港澳", "HK", "Gcore"],
+    ["伦敦 Archive", "欧洲", "GB", "OVHcloud"],
+    ["悉尼 Monitor", "大洋洲", "AU", "AWS"],
+    ["多伦多 Backup", "北美", "CA", "Oracle Cloud"],
+  ];
+  return Array.from({ length: size }, (_, index) => {
+    const referenceNames = [
+      ["hkcloudx-hk.mini.v6", "香港", "HK", "HKCloud"], ["hytron-hk.0.74", "香港", "HK", "Hytron"],
+      ["hytron-hk.0.63", "香港", "HK", "Hytron"], ["hosuyun-la.pro.a", "美国", "US", "Hosuyun"],
+      ["t2", "新加坡", "SG", "Oracle"], ["mac mini m4 16g", "日本", "JP", "Apple"],
+      ["wawo-creator.300r", "香港", "HK", "Wawo"], ["joysol-hk.bgp.no2", "香港", "HK", "Joysol"],
+      ["vps.taxi-jp.mini", "日本", "JP", "VPS Taxi"], ["vps.taxi-la.mini", "美国", "US", "VPS Taxi"]
+    ];
+    const docsNode = activeFixture.luminousReference ? (referenceNames[index] || ["cloud-node-"+index, docsNames[index%8][1], docsNames[index%8][2], docsNames[index%8][3]]) : docsNames[index % docsNames.length];
+    return {
+    uuid: `node-${index}`,
+    name: activeFixture.docs ? docsNode[0] : `Scale Node ${index}`,
+    group: activeFixture.docs ? docsNode[1] : `Group ${index % 8}`,
+    region: activeFixture.docs ? docsNode[2] : `R${index % 16}`,
+    hidden: false,
+    ...(activeFixture.run === "luminous" ? {ipv4:`192.0.2.${index+1}`,ipv6:`2001:db8::${index+1}`} : {}),
+    cpu_name: index % 2 === 0 ? "AMD EPYC 7B13" : "Intel Xeon Platinum",
+    cpu_cores: 2 + (index % 4) * 2,
+    mem_total: 2_147_483_648,
+    disk_total: activeFixture.luminousReference ? 4.85*1024**3 : 21_474_836_480,
+    weight: index,
+    os: "linux",
+    arch: "amd64",
+    virtualization: "kvm",
+    version: "1.0.0",
+    provider: activeFixture.docs ? docsNode[3] : "",
+    business_role: activeFixture.docs ? ["边缘加速", "核心服务", "监控探针"][index % 3] : "",
+    price: activeFixture.docs ? 5 + index * 2 : 0,
+    billing_cycle: activeFixture.docs ? "monthly" : "",
+    auto_renewal: activeFixture.docs,
+    currency: activeFixture.docs ? "USD" : "",
+    expired_at: activeFixture.docs ? `2027-${String((index % 9) + 1).padStart(2, "0")}-20T00:00:00Z` : "",
+    tags: activeFixture.docs ? ["production", "edge", "backup"][index % 3] : "",
+    traffic_limit: activeFixture.quotaUsage && index === 6 ? 0 : 1_000_000_000_000,
+    traffic_limit_type: "sum",
+    ...(activeFixture.luminousReference ? {
+      ipv4: `103.82.12.${18+index}`, ipv6:`2602:f506::${index+1}`, os:index===5?"macOS":index===4?"Windows":"Debian GNU/Linux 12", cpu_cores:1,
+      mem_total: 973*1024*1024, disk_total:4.85*1024**3, version:"1.5.11",
+      price:5,billing_cycle:"yearly",expired_at:new Date(Date.now()+(index>9?120+index:[358,18,22,10,36,5,20,18,12,28][index])*86400000).toISOString(),
+      tags:index===0?"1C/1.5G/500M;CN2/10099/CMI":index<3?"512M/3G/1000M":"512M/10G/100M",
+      traffic_limit: index===0?2.93*1024**4:100*1024**3,
+      created_at:"2023-11-05T00:00:00Z"
+    } : {}),
+    ...(activeFixture.cupertinoResources ? {
+      tags: index === 0 ? "1C/1.5G/500M;CN2/10099/CMI/长标签完整显示-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" : "2C/2G/5G;CN2 GIA/9929",
+      traffic_limit_type: ["up", "down", "sum", "min", "max", "sum"][index % 6],
+      traffic_limit: index >= 6 ? 0 : 100 * 1024 ** 3,
+      price: index === 1 ? -1 : 5,
+      billing_cycle: index === 7 ? "lifetime" : "monthly",
+      expired_at: index === 6 ? "" : new Date(Date.now() + ([-2, 1, 12, 7, 45, 90, 0, 36600][index]) * 86400000).toISOString(),
+    } : {}),
+  };
+  });
+}
+
+function legacyReport(index, sequence) {
+  return {
+    online: !(activeFixture.reportOffline && index === 0),
+    cpu: { usage: (index + sequence) % 100 },
+    ram: { used: 536_870_912 + ((index + sequence) % 100) * 1_048_576, total: 2_147_483_648 },
+    swap: { used: 0, total: 0 },
+    disk: { used: 5_368_709_120, total: 21_474_836_480 },
+    load: { load1: 0.5, load5: 0.4, load15: 0.3 },
+    network: {
+      up: sequence * 100 + index,
+      down: sequence * 120 + index,
+      totalUp: sequence * 1_000 + index,
+      totalDown: sequence * 2_000 + index,
+    },
+    connections: { tcp: 10, udp: 2 },
+    uptime: sequence,
+    process: 20,
+    updated_at: activeFixture.reportOffline && index === 0 ? Math.floor(Date.now()/1000)-3*3600 : 1_700_000_000 + sequence,
+  };
+}
+
+// Upstream's common:getNodesLatestStatus intentionally returns a flat report
+// map instead of the fork's nested RealtimeDelta shape. Keep the fixture on
+// that wire format so this gate exercises the actual normalizer.
+function officialLatestStatus(index, sequence) {
+  if (activeFixture.aurora) {
+    const status = auroraStatus(activeFixture.auroraQuotaFractions?.[index], activeFixture.crystal);
+    if (activeFixture.crystalLowMeters) Object.assign(status, index === 0
+      ? { cpu: .04, ram: 1024 ** 2, disk: 2 * 1024 ** 2, load: .001 }
+      : { cpu: 0, ram: 0, disk: 0, load: 0 });
+    return { ...status, online: !activeFixture.auroraOffline };
+  }
+  const docsOffline = (activeFixture.reportOffline || activeFixture.docs) && index === 0;
+  return {
+    online: activeFixture.cupertino ? index !== 7 : activeFixture.luminousReference ? index < 42 : !docsOffline,
+    cpu: activeFixture.luminousReference ? [1.51,.3,0,.1,30,5.6,1,1.1,1.8,.3][index%10] : (index + sequence) % 100,
+    ram: activeFixture.luminousReference ? (973*1024*1024)*[.175,.24,.24,.073,.77,.76,.16,.16,.21,.24][index%10] : 536_870_912 + ((index + sequence) % 100) * 1_048_576,
+    ram_total: activeFixture.luminousReference ? 973*1024*1024 : 2_147_483_648,
+    swap: 0,
+    swap_total: 0,
+    disk: activeFixture.luminousReference ? (4.85*1024**3)*[.738,.38,.38,.084,.32,.43,.26,.22,.33,.35][index%10] : 5_368_709_120,
+    disk_total: activeFixture.luminousReference ? 4.85*1024**3 : 21_474_836_480,
+    load: 0.5,
+    load5: 0.4,
+    load15: 0.3,
+    net_in: activeFixture.luminousReference ? 2048+index*973 : sequence * 120 + index,
+    net_out: activeFixture.luminousReference ? 506+index*120 : sequence * 100 + index,
+    net_total_up: activeFixture.luminousReference ? (index===0?180:7+index)*1024**3 : (activeFixture.dailyVisual ? 200_000_000_000 : activeFixture.quotaUsage ? index === 7 ? 600_000_000_000 : 20_000_000_000 * (index + 1) : 0) + sequence * 1_000 + index,
+    net_total_down: activeFixture.luminousReference ? (index===0?185:12+index)*1024**3 : (activeFixture.dailyVisual ? 300_000_000_000 : activeFixture.quotaUsage ? index === 7 ? 650_000_000_000 : 40_000_000_000 * (index + 1) : 0) + sequence * 2_000 + index,
+    connections: 12,
+    connections_udp: 2,
+    uptime: activeFixture.luminousReference ? (index===0?358:20+index)*86400 : activeFixture.workspaceMetrics ? 6 * 86400 : sequence,
+    process: 20,
+    time: docsOffline ? Math.floor((Date.now() - 3 * 60 * 60 * 1_000) / 1_000) : activeFixture.workspaceMetrics ? Math.floor(Date.now() / 1000) : 1_700_000_000 + sequence,
+  };
+}
+
+function toIsoOrNow(value) {
+  const date = typeof value === "string" || typeof value === "number" ? new Date(value) : new Date();
+  return Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString();
+}
+
+function requestedEntityIds(params, fixture) {
+  const value = Array.isArray(params?.entity_ids) ? params.entity_ids : [];
+  const allowed = new Set(nodeList(fixture.nodes).map((node) => node.uuid));
+  const ids = value.filter((uuid) => typeof uuid === "string" && allowed.has(uuid));
+  return ids.length > 0 ? ids : nodeList(fixture.nodes).map((node) => node.uuid);
+}
+
+function officialPingMetricSeries(params, fixture) {
+  const metricKeys = Array.isArray(params?.metric_keys) ? params.metric_keys : [];
+  if (fixture.reportEmpty) return {series: []};
+  const entityIds = requestedEntityIds(params, fixture);
+  const end = new Date(toIsoOrNow(params?.end)).getTime();
+  const start = new Date(toIsoOrNow(params?.start)).getTime();
+  const windowStart = Number.isFinite(start) && start < end ? start : end - 3_600_000;
+  const requestedPointCount = Math.max(1, Number(params?.max_points) || 24);
+  // The interactive Ping regression run must exercise the long-history parser
+  // and uPlot path with the same density requested in production. Scale tests
+  // keep their compact response so the gate remains focused on node volume.
+  const pointCount = fixture.luminousReference ? 150 : Math.min(fixture.comprehensive ? 480 : fixture.ui ? 4_320 : 24, requestedPointCount);
+  const series = [];
+
+  for (const metricKey of metricKeys) {
+    const crystalThroughput = fixture.crystal && metricKey.startsWith("net.");
+    if (!["ping.latency_ms", "ping.loss", "net.total.up", "net.total.down"].includes(metricKey) && !fixture.comprehensive && !crystalThroughput) continue;
+    for (const [index, uuid] of entityIds.entries()) {
+      let points = Array.from({ length: pointCount }, (_, point) => {
+        const fraction = pointCount === 1 ? 1 : fixture.comprehensive && metricKey === 'cpu.usage' && end - windowStart > 2 * 86400000
+          ? point < pointCount / 2 ? (point / (pointCount / 2)) * .97 : .97 + ((point - pointCount / 2) / (pointCount / 2 - 1)) * .03
+          : point / (pointCount - 1);
+        const hasLoss = point === Math.floor(pointCount / 2);
+        const count = hasLoss ? 2 : 1;
+        return {
+          time: new Date(windowStart + (end - windowStart) * fraction).toISOString(),
+          value: fixture.luminousReference && metricKey=== "cpu.usage" ? 1+Math.sin(point/9)*.12+Math.exp(-Math.pow((point-22)/9,2))*2.1+Math.exp(-Math.pow((point-128)/10,2))*1.15 : fixture.comprehensive && metricKey === "cpu.usage" && [201, 203].includes(point) ? null : metricKey === "ping.latency_ms"
+            ? 20 + ((index + point) % 30)
+            : metricKey === "ping.loss"
+              ? hasLoss ? 0.5 : 0
+              : metricKey === "gpu.usage" ? 45
+              : metricKey === "cpu.usage" ? point === 120 ? 87 : 10 + point % 25
+              : ["memory.used", "disk.used", "swap.used"].includes(metricKey) ? 500_000_000 + point * 1000
+              : metricKey.startsWith("net.total.") ? 1_000 + index + (fixture.dailyVisual ? point * 4 + Math.sin(point / 8) * 24 : point * (metricKey === "net.total.up" ? 2 : 3))
+              : metricKey.startsWith("net.") ? fixture.workspaceMetrics ? 70000 + Math.sin(point / 8) * 20000 + Math.sin(point / 3) * 12000 + Math.exp(-Math.pow((point-30)/8,2))*80000 + Math.exp(-Math.pow((point-65)/6,2))*55000 : 10000 + point * 50 : 20 + point % 10,
+          count,
+          tags: { task_id: "1" },
+        };
+      });
+      if (fixture.reportOffline) points = points.filter(point=>Date.parse(point.time)<=Date.now()-3*3600000);
+      if (fixture.comprehensive && metricKey.startsWith('gpu.') && metricKey !== 'gpu.usage') points = points.flatMap(p => [0,1].map(device => ({...p, value: metricKey === 'gpu.temperature' ? 45 + device * 5 : metricKey === 'gpu.memory.total' ? 4294967296 : metricKey.includes('memory') ? 500000000 + device * 100000000 : 40 + device * 10, tags: { device_index: String(device), device_name: `Example GPU ${device}` }})));
+      series.push({
+        metric_key: metricKey,
+        entity_id: uuid,
+        tags: { task_id: "1" },
+        points: metricKey.startsWith("net.total.") && (fixture.trafficEmpty || (fixture.ui && !fixture.comprehensive && index === entityIds.length - 1))
+          ? null
+          : points,
+      });
+    }
+  }
+
+  return {
+    start: new Date(windowStart).toISOString(),
+    end: new Date(end).toISOString(),
+    series: fixture.aurora ? fixture.auroraEmpty || fixture.auroraNoMeasurements ? [] : auroraSeries(series, fixture.auroraHistoryPoints, fixture.crystal) : fixture.workspaceMetrics ? series.flatMap(s => s.metric_key.startsWith('ping.') ? [1,2,3,4,5,6].map(id => ({...s,tags:{task_id:String(id)},points:s.points?.map((p,i)=>({...p,tags:{task_id:String(id)},value:s.metric_key==='ping.latency_ms' ? [165,281,37,85,178,28][id-1] + Math.sin(i / (id+2)) * (id===4?40:6) + (id===4?Math.exp(-Math.pow((i-65)/16,2))*310:0) : id===1 ? (i%5===0?1:0) : id===4 ? (i%20===0?.5:0) : 0}))})) : [s]) : series,
+    count: series.length,
+  };
+}
+
+function officialPingStats(params, fixture) {
+  const entityIds = requestedEntityIds(params, fixture);
+  if (fixture.aurora) return fixture.auroraEmpty || fixture.auroraNoMeasurements ? {stats:[],count:0} : auroraStats(entityIds, fixture.crystal);
+  const start = toIsoOrNow(params?.start);
+  const end = toIsoOrNow(params?.end);
+  return {
+    start,
+    end,
+    stats: entityIds.flatMap((uuid, index) => (fixture.luminousReference ? [1,2,3,4,5,6] : [1]).map(id => ({
+      entity_id: uuid,
+      task_id: String(id),
+      name: fixture.run === "network-center" ? "电信 IPv4" : "edge",
+      type: "icmp",
+      interval: 60,
+      total: 60,
+      valid: 59,
+      loss: 1.67,
+      loss_approximate: false,
+      min: 10,
+      max: 80,
+      avg: 25 + (index % 3),
+      latest: 20 + (index % 30),
+      p99_p50_ratio: 1.2,
+    }))),
+    count: entityIds.length,
+  };
+}
+
+function sendJson(response, body) {
+  response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  response.end(JSON.stringify(body));
+}
+
+function sendOfficialRestEnvelope(response, data) {
+  sendJson(response, { status: "success", message: "ok", data });
+}
+
+function sendRpcResult(response, id, result) {
+  sendJson(response, { jsonrpc: "2.0", id, result });
+}
+
+function sendRpcMethodMissing(response, id, method) {
+  sendJson(response, {
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32601, message: `method not found: ${method}` },
+  });
+}
+
+let backgroundAttempts = 0;
+let failNextPreviewDocument = false;
+const server = createServer(async (request, response) => {
+  // Capture the immutable fixture at request start. A navigation can switch
+  // profiles while an older long-poll is still unwinding; it must not be
+  // counted against, or answered as, the next profile's run.
+  const fixture = activeFixture;
+  const url = new URL(request.url ?? "/", "http://fixture.local");
+  if (url.searchParams.get('blackwhite-preview') === '1' && failNextPreviewDocument) {
+    failNextPreviewDocument = false;
+    response.writeHead(503, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
+    return response.end('<!doctype html><title>Preview temporarily unavailable</title>');
+  }
+
+  if (fixture.reportWorkerFailure === 'html' && /\/assets\/instanceReport\.worker-[^/]+\.js$/.test(url.pathname)) {
+    count('report-worker-html',fixture.run);
+    response.writeHead(200,{'Content-Type':'text/html','Cache-Control':'no-store'});
+    return response.end('<!doctype html><title>Theme asset replaced</title>');
+  }
+  if (url.pathname === '/studio-retry.svg') {
+    backgroundAttempts += 1;
+    response.setHeader('Cache-Control', 'no-store');
+    if (backgroundAttempts === 1) { response.writeHead(503); return response.end('try again'); }
+    response.setHeader('Content-Type', 'image/svg+xml');
+    return response.end('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="blue"/></svg>');
+  }
+  if (url.pathname === "/api/nodes") {
+    count("nodes", fixture.run);
+    const nodes = nodeList(fixture.nodes);
+    return isOfficialFixture(fixture)
+      ? sendOfficialRestEnvelope(response, nodes)
+      : sendJson(response, nodes);
+  }
+  if (url.pathname === "/api/public") {
+    count("public", fixture.run);
+    const publicConfig = {
+      sitename: fixture.docs ? "Blackwhite 演示站" : "Komari Scale Gate",
+      theme: "blackwhite",
+      ...(fixture.ui ? { record_preserve_time: 744, ping_record_preserve_time: 24 } : {}),
+      theme_settings: {
+        showHomeOverview: Boolean(fixture.docs || fixture.trafficSummary),
+        showGroupTabs: Boolean(fixture.docs),
+        desktopNodeViewMode: fixture.docs ? "standard" : "compact",
+        mobileNodeViewMode: "compact",
+        showCostSummary: true,
+        // Use an absolute URL: production correctly rejects relative rate
+        // endpoints, which otherwise sends CI to the real public API.
+        costRateApiUrl: `http://127.0.0.1:${address.port}/api/docs-rates`,
+        homepagePingBindings: fixture.crystalPingBindings ?? Object.fromEntries((fixture.cupertino ? [1,2,3] : fixture.luminousReference ? [1,2,3,4,5,6] : [1]).filter(id=>!fixture.aurora || !fixture.auroraFamilies || fixture.auroraFamilies.includes(id<=3?"4":"6")).map(id=>[String(id),nodeList(fixture.nodes).map(node=>node.uuid)])),
+        homepagePingTaskOrder: fixture.crystalPingTaskOrder,
+        ...(fixture.ui ? { showGroupTabs: true, showPingChart: true } : {}),
+        ...(fixture.ui ? savedUiSettings : {}),
+        ...(fixture.cupertinoResources ? { showConnections: true } : {}),
+      },
+    };
+    return isOfficialFixture(fixture)
+      ? sendOfficialRestEnvelope(response, publicConfig)
+      : sendJson(response, publicConfig);
+  }
+  if (url.pathname === "/api/docs-rates") {
+    return sendJson(response, {
+      base: "USD",
+      date: "2026-09-10",
+      rates: { USD: 1, CNY: 7.12, EUR: 0.86, JPY: 147.2 },
+    });
+  }
+  if (url.pathname === "/api/me") {
+    count("me", fixture.run);
+    return sendJson(response, { logged_in: Boolean(fixture.ui) && !fixture.auroraGuest, username: "test", uuid: "test" });
+  }
+  if (fixture.ui && url.pathname === "/api/admin/client/list") return sendJson(response, nodeList(fixture.nodes).map(node => fixture.docs ? node : ({ ...node, capability_ping: false })));
+  if (fixture.ui && url.pathname === "/api/admin/ping") return sendJson(response, fixturePingTaskNames(fixture).map((name, index) => ({ id: index + 1, name, type: "icmp", interval: 60, clients: nodeList(fixture.nodes).map((node) => node.uuid) })));
+  if ((url.pathname === '/api/blackwhite-network-observatory/v3/public/speeds' || (url.pathname === '/api/blackwhite-network-observatory/v3/home-speeds' && request.method === 'GET'))) {
+    count('home-speeds');
+    if (fixture.aurora) {
+      const data = auroraSpeeds(fixture.crystal, fixture.crystalControls);
+      return sendJson(response, {...data, quickCheck: !fixture.crystal || Boolean(fixture.crystalControls), nodes:fixture.auroraNoMeasurements?{}:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,data.nodes['node-0']])), configuredFamilies:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,fixture.auroraSpeedFamilies??fixture.auroraFamilies??['4','6']])), quickFamilies:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,['4','6']])), ...(fixture.auroraEmpty ? {available:false,nodes:{},configuredFamilies:{"node-0":[]},quickCheck:false,quickFamilies:{}} : {}), display: !fixture.auroraHidden});
+    }
+    if (!fixture.reports) return sendJson(response, { available: false, nodes: {}, access: fixture.ui ? 'admin' : 'public', display: true, published: [] });
+    return sendJson(response, { available: true, nodes: Object.fromEntries(nodeList(fixture.nodes).filter(n => fixture.ui || homeSpeedNodes.includes(n.uuid)).map(n => {
+      const families = n.uuid==='node-2' ? {...projectedSpeeds,'6':null} : n.uuid==='node-1' ? {...projectedSpeeds,'4':null} : projectedSpeeds;
+      const updated=Object.fromEntries(['4','6'].map(f=>[f,families[f]?cardProjection(families[f],cardStamp(n.uuid,'china-speed',f)):null]));
+      return [n.uuid, url.searchParams.get('families')==='1' ? updated : updated['6']||updated['4']];
+    })), quickCheck:Boolean(fixture.ui),quickFamilies:fixture.ui?cardFamilies(fixture):{}, access: fixture.ui ? 'admin' : 'public', display: homeSpeedDisplay, showDetails: homeSpeedShowDetails, published: homeSpeedNodes });
+  }
+  if ((url.pathname === '/api/blackwhite-network-observatory/v3/public/routes' || (url.pathname === '/api/blackwhite-network-observatory/v3/home-routes' && request.method === 'GET'))) {
+    count('home-routes');
+    if (fixture.aurora) {
+      const data = auroraRoutes(fixture.crystal);
+      return sendJson(response, {...data, diagnostics: fixture.homeDiagnostics, ipCapabilityExpanded: fixture.ipCapabilityExpanded, quickCheck: !fixture.crystal || Boolean(fixture.crystalControls), nodes:fixture.auroraNoMeasurements?{}:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,data.nodes['node-0']])), configuredFamilies:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,fixture.auroraRouteFamilies??fixture.auroraFamilies??['4','6']])), quickFamilies:Object.fromEntries(nodeList(fixture.nodes).map(n=>[n.uuid,['4','6']])), ...(fixture.auroraEmpty ? {available:false,nodes:{},configuredFamilies:{"node-0":[]},quickCheck:false,quickFamilies:{}} : {}), display: !fixture.auroraHidden});
+    }
+    if (fixture.reports) return sendJson(response, { available: true, nodes: Object.fromEntries(nodeList(fixture.nodes).filter(n => fixture.ui || homeRouteNodes.includes(n.uuid)).map(n => [n.uuid,Object.fromEntries(['4','6'].map(f=>[f,cardProjection(projectedRouteFamilies[f],cardStamp(n.uuid,'routes',f))]))])), quickCheck:Boolean(fixture.ui),quickFamilies:fixture.ui?cardFamilies(fixture):{}, published: homeRouteNodes, display: homeRouteDisplay, labelMode: homeRouteLabelMode, showDetails: homeRouteShowDetails, access: fixture.ui ? "admin" : "public" });
+    response.writeHead(404, { 'Content-Type':'application/json' });
+    response.end(JSON.stringify({error:'plugin unavailable'}));
+    return;
+  }
+  if (fixture.reports && url.pathname.startsWith('/api/blackwhite-network-observatory/v3/')) {
+    const suffix=url.pathname.slice('/api/blackwhite-network-observatory/v3/'.length);
+    if(suffix==='capabilities')return sendJson(response,reportCapabilities);
+    if(suffix==='catalog')return sendJson(response,{...reportCapabilities,catalogVersion:reportCatalogVersion,endpoints:reportEndpoints,presets:reportPresets,suites:fixture.planCards?Array.from({length:7},(_,i)=>({id:'plan-'+i,name:['测速-v4','测速-v6','国际线路','大陆线路-v4','大陆线路-v6','TcpQuality','NodeQuality'][i],clients:i===3?[]:['node-0'],groups:i===3?['Group 0']:[],inherit:true,enabled:i!==6,trafficAccepted:true,modules:[reportRoundData.international.parameters],catalogVersion:reportCatalogVersion})):fixture.reportSuites??(reportSavedSuite?[reportSavedSuite]:[]),revision:0,inventory:nodeList(fixture.nodes).map(n=>({uuid:n.uuid,name:n.name,group:n.group||'',ip:'8.8.8.8',publicVisible:true})),timezones:['Asia/Shanghai','America/Los_Angeles'],probes:[],homeRouteNodes,homeRouteDisplay,homeRouteLabelMode,homeRouteShowDetails,homeSpeedNodes,homeSpeedDisplay,homeSpeedShowDetails,homeDiagnosticNodes:fixture.homeDiagnosticNodes,homeDiagnosticDisplay:fixture.homeDiagnosticDisplay,ipCapabilityExpanded:fixture.ipCapabilityExpanded});
+    if(/^nodes\/[^/]+\/(?:rounds|history-summary)$/.test(suffix)){
+      const module=url.searchParams.get('module'), suite=url.searchParams.get('suite'), r=fixtureReportRound(module);
+      if (fixture.planCards && suite && r) r.suiteId=suite;
+      const rounds = fixture.comprehensive ? [r,fixtureReportRound(module,true)] : [r];
+      return sendJson(response,{rounds:rounds.filter(round=>round && (!suite || suite===round.suiteId)),nextCursor:null});
+    }
+    if(/^nodes\/[^/]+\/rounds\/[^/]+\/original-images$/.test(suffix)) return sendJson(response,suffix.includes('nodequality-full') ? {nodeArchive: process.env.BROWSER_REPORT_NODE_ARCHIVE ? readFileSync(process.env.BROWSER_REPORT_NODE_ARCHIVE,'utf8') : originalNodeArchive} : {pages:[{title:'国际互联',svg:process.env.BROWSER_REPORT_TCP_SVG ? readFileSync(process.env.BROWSER_REPORT_TCP_SVG,'utf8') : '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="3000" viewBox="0 0 1000 3000"><rect width="100%" height="100%" fill="#1f1e2a"/><text x="40" y="90" fill="#eee8d0" font-size="30">TcpQuality Original Report</text><text x="40" y="2900" fill="#87d88d" font-size="22">LAST_ROW_OF_INTERNATIONAL</text></svg>'}]});
+    if(/^nodes\/[^/]+\/rounds\/[^/]+$/.test(suffix)){const id=suffix.split('/').at(-1), prior=id.endsWith('-older'), base=prior?id.slice(0,-6):id;const module=Object.keys(reportRoundData).find(key=>reportRoundData[key].id===base);return sendJson(response,fixtureReportRound(module,prior));}
+    let raw='';for await(const part of request)raw+=part;const body=raw?JSON.parse(raw):{};
+    if(/^nodes\/[^/]+\/card-check$/.test(suffix)) {
+      count('card-check-start'); const nodeUuid=suffix.split('/')[1];
+      let run=[...cardRuns.values()].find(r=>r.nodeUuid===nodeUuid&&r.module===body.module&&r.family===body.family&&r.phase!=='finished');
+      if(!run) {run={nodeUuid,id:`00000000-0000-4000-8000-${String(++cardSerial).padStart(12,'0')}`,module:body.module,family:body.family,phase:'queued',state:'running',polls:0,suiteName:'卡片测试方案',waitReason:'等待公共端点队列',counts:{expected:3,completed:0,ok:0,partial:0,failed:0,missing:0,cancelled:0}};cardRuns.set(run.id,run);}
+      return sendJson(response,run);
+    }
+    if(suffix==='card-checks/progress') {
+      count('card-check-status');
+      return sendJson(response,{checks:body.checks.map(ref=>{const run=cardRuns.get(ref.id);if(!run)throw new Error('Unknown card fixture round');
+        run.polls++; if(run.polls>=3){run.phase='finished';run.state=run.module==='china-speed'?'partial':'complete';run.completedAt||=new Date().toISOString();run.counts={...run.counts,completed:3,ok:run.module==='china-speed'?2:3,missing:run.module==='china-speed'?1:0};}
+        else if(run.polls>=2){run.phase='running';run.waitReason='';run.counts={...run.counts,completed:1,ok:1};}
+        return {...run};})});
+    }
+    if(suffix==='home-routes' && request.method==='PUT'){homeRouteNodes=body.nodeUuids;homeRouteDisplay=body.display;homeRouteLabelMode=body.labelMode??homeRouteLabelMode;homeRouteShowDetails=body.showDetails??homeRouteShowDetails;return sendJson(response,{revision:0});}
+    if(suffix==='home-speeds' && request.method==='PUT'){homeSpeedNodes=body.nodeUuids;homeSpeedDisplay=body.display;homeSpeedShowDetails=body.showDetails??homeSpeedShowDetails;return sendJson(response,{revision:0});}
+    if(suffix==='home-diagnostics' && request.method==='PUT'){
+      for (const section of body.section === 'ip-capability' ? ['ip-quality','media-unlock'] : [body.section]) {
+        (fixture.homeDiagnosticNodes??={})[section]=body.nodeUuids;
+        (fixture.homeDiagnosticDisplay??={})[section]=body.display;
+      }
+      if (typeof body.ipCapabilityExpanded === 'boolean') fixture.ipCapabilityExpanded = body.ipCapabilityExpanded;
+      return sendJson(response,{revision:0});
+    }
+    if(suffix==='preview'){const suite={...body,id:'suite-fixture',catalogVersion:reportCatalogVersion,modules:body.modules.map(m=>({...m,nextAt:Date.now()+60000}))};return sendJson(response,{suite,exceedsCapacity:false,nodes:body.clients.map(uuid=>({uuid,name:'Scale Node '+uuid.split('-').at(-1),capacity:{measurementsPerDay:100,samplesPerDay:1000,speedSecondsPerDay:0,estimatedLightSecondsPerDay:450},modules:suite.modules.map(m=>({module:m.module,nextAt:m.nextAt,expected:m.endpoints.length,estimatedQueueSeconds:20,targets:[]}))}))});}
+    if((fixture.planCards || fixture.reportSuites) && /^suites\/[^/]+\/run$/.test(suffix)){ reportPlanRuns.push({suffix,body}); return sendJson(response,{ok:true}); }
+    if(suffix==='suites'){reportSavedSuite={...body,id:'suite-fixture',catalogVersion:reportCatalogVersion,modules:body.modules.map(m=>({...m,nextAt:Date.now()+60000}))};return sendJson(response,{suite:reportSavedSuite,revision:0});}
+    return sendJson(response,{ok:true});
+  }
+  if (fixture.network && url.pathname.startsWith('/api/blackwhite-network-observatory/v2/')) {
+    const suffix = url.pathname.slice('/api/blackwhite-network-observatory/v2/'.length);
+    if (suffix === 'catalog') return sendJson(response, { revision: 0, runnerRelease: reportRequire('../network-observatory/plugin/src/runner-release.json'), updatePolicies: pointFixture.updatePolicies, inventory: nodeList(fixture.nodes), workers: Object.fromEntries(pointFixture.registeredNodes.map(id=>['node:'+id,{version:reportRequire('../network-observatory/plugin/src/runner-release.json').version,seenAt:Date.now(),tools:['curl','nexttrace','traceroute','mtr','iperf3','openssl','nping'],authScheme:'oaep',features:['report-v3','latency-samples','full-mtr','speed-intervals','http-speed','tcp-quality','public-speed']}])), endpoints: {}, probes: pointFixture.probes, registeredNodes: pointFixture.registeredNodes });
+    let raw=''; for await (const part of request) raw += part;
+    const body = raw ? JSON.parse(raw) : {};
+    if (suffix === 'probes' && request.method === 'POST') { pointFixture.probes.push({ ...body, id: 'probe-fixture', online: false }); return sendJson(response, { id: 'probe-fixture', token: 'b'.repeat(64) }); }
+    if (suffix.endsWith('/token')) {count('credential-mutation');const uuid=suffix.split('/')[1];if(request.method==='POST')pointFixture.registeredNodes=[...new Set([...pointFixture.registeredNodes,uuid])];else pointFixture.registeredNodes=pointFixture.registeredNodes.filter(id=>id!==uuid);return sendJson(response, { uuid, token: 'a'.repeat(64) });}
+    if(suffix.endsWith('/update-policy')&&request.method==='PUT'){const [,role,id]=suffix.split('/');pointFixture.updatePolicies[role+':'+id]={enabled:body.enabled};return sendJson(response,{ok:true});}
+    return sendJson(response, { ok: true });
+  }
+  if (url.pathname.startsWith('/api/blackwhite-network-observatory/v1/')) {
+    count('removed-network-api', fixture.run); response.writeHead(404); return response.end('{}');
+  }
+  if (fixture.ui && url.pathname === "/api/admin/theme/settings") {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    if (rejectNextStudioSave) {
+      rejectNextStudioSave = false;
+      response.writeHead(403, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ message: 'Session expired' }));
+      return;
+    }
+    if (studioSaveBarrier) await studioSaveBarrier;
+    savedUiSettings = JSON.parse(Buffer.concat(chunks).toString());
+    return sendJson(response, { status: "success" });
+  }
+  if (url.pathname === "/api/rpc2" && request.method === "POST") {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    recordRpcRequest(fixture.run, payload.method, payload.params);
+
+    if (isOfficialFixture(fixture)) {
+      if (payload.method === "rpc.discover") {
+        return sendRpcMethodMissing(response, payload.id, payload.method);
+      }
+      if (payload.method === "rpc.methods") {
+        return sendRpcResult(response, payload.id, [
+          "common:getNodesLatestStatus",
+          "public:getPublicPingTasks",
+          "public:queryMetrics",
+          "public:getPingMetricStats",
+        ]);
+      }
+      if (payload.method === "common:getNodesLatestStatus") {
+        const reports = Object.fromEntries(
+          Array.from({ length: fixture.nodes }, (_, index) => [
+            `node-${index}`,
+            officialLatestStatus(index, 1),
+          ]),
+        );
+        return sendRpcResult(response, payload.id, reports);
+      }
+      if (payload.method === "public:getPublicPingTasks") {
+        if (fixture.ui) return sendRpcResult(response, payload.id, fixturePingTaskNames(fixture).map((name, index) => ({ id: index + 1, name, weight: index, clients: nodeList(fixture.nodes).map((node) => node.uuid), default_on: true, type: "icmp", interval: 60 })));
+        return sendRpcResult(response, payload.id, [{
+          id: 1,
+          weight: 1,
+          name: fixture.run === "network-center" ? "电信 IPv4" : "edge",
+          clients: nodeList(fixture.nodes).map((node) => node.uuid),
+          default_on: true,
+          type: "icmp",
+          interval: 60,
+        }]);
+      }
+      if (payload.method === "public:queryMetrics") {
+        if (fixture.trafficFailure && payload.params?.metric_keys?.includes("net.total.up"))
+          return sendJson(response, { jsonrpc: "2.0", id: payload.id, error: { code: -32603, message: "fixture history unavailable" } });
+        return sendRpcResult(response, payload.id, officialPingMetricSeries(payload.params, fixture));
+      }
+      if (payload.method === "public:getPingMetricStats") {
+        return sendRpcResult(response, payload.id, officialPingStats(payload.params, fixture));
+      }
+      return sendRpcMethodMissing(response, payload.id, payload.method);
+    }
+
+    if (payload.method === "rpc.discover") {
+      return sendRpcResult(response, payload.id, {
+        jsonrpc_version: "2.0",
+        contract: "komari.rpc.v2.4",
+        methods: ["common:getRealtimeDelta", "common:getPingOverview"],
+        capabilities: { "realtime.delta": "1", "ping.overview": "2" },
+      });
+    }
+    if (payload.method === "common:getRealtimeDelta") {
+      const since = Number(payload.params?.since ?? 0);
+      const sequence = since + 1;
+      const reports = {};
+      if (since === 0 || (fixture.soak && since < SOAK_TICK_TARGET)) {
+        for (let index = 0; index < fixture.nodes; index += 1) {
+          reports[`node-${index}`] = legacyReport(index, sequence);
+        }
+      }
+      const result = {
+        sequence,
+        snapshot: since === 0,
+        reports,
+        online: since === 0 ? nodeList(fixture.nodes).filter(node=>!fixture.reportOffline || node.uuid!=="node-0").map((node) => node.uuid) : undefined,
+      };
+      if (!fixture.soak && since > 0) await new Promise((resolve) => setTimeout(resolve, 250));
+      if (fixture.soak && since >= SOAK_TICK_TARGET) await new Promise((resolve) => setTimeout(resolve, 250));
+      return sendRpcResult(response, payload.id, result);
+    }
+    if (payload.method === "common:getPingOverview") {
+      const to = Math.floor(Date.now() / 1_000);
+      const stats = {};
+      const series = {};
+      for (let index = 0; index < fixture.nodes; index += 1) {
+        const uuid = `node-${index}`;
+        stats[uuid] = { "1": { name: "edge", total: 60, lost: 1, latest: 20 + (index % 30), avg: 25, tail: 0.2, loss: 1.67, min: 10, max: 80 } };
+        series[uuid] = { "1": Array.from({ length: 24 }, (_, point) => ({
+          time: to - (23 - point) * 150,
+          value: 20 + ((index + point) % 30),
+          sample_count: 2,
+          loss_count: point === 11 ? 1 : 0,
+          loss: point === 11 ? 50 : 0,
+        })) };
+      }
+      return sendRpcResult(response, payload.id, {
+        from: to - 3_600,
+        to,
+        tasks: [{ id: 1, name: "edge", type: "icmp", interval: 60 }],
+        stats,
+        series,
+      });
+    }
+    if (fixture.comprehensive && payload.method === "common:getRecords") {
+      if (fixture.reportEmpty) return sendRpcResult(response,payload.id,{records:[],count:0,tasks:[]});
+      const end = Date.parse(toIsoOrNow(payload.params.end));
+      const requestedStart = payload.params.start ? Date.parse(payload.params.start) : end - (payload.params.hours || 6) * 3600000;
+      const start = Math.max(requestedStart, Date.now() - 60 * 86400000);
+      const records = end <= start ? [] : Array.from({ length: 150 }, (_, i) => payload.params.type === "ping"
+        ? { client: "node-0", task_id: 1, time: new Date(start + (end - start) * i / 150).toISOString(), value: i === 100 ? -1 : 20 + i % 20 }
+        : { client: "node-0", time: new Date(start + (end - start) * i / 150).toISOString(), cpu: i === 120 ? 87 : 10 + i % 25, ram: 500000000 + i * 1000, disk: 5000000000 + i * 1000, net_total_up: i * 10000, net_total_down: i * 30000, net_in: i * 100, net_out: i * 50, load: .5, process: 20, connections: 30, connections_udp: 2 });
+      return sendRpcResult(response, payload.id, { records, count: records.length, tasks: [{ id: 1, name: "历史任务", interval: 60, type: "icmp", target: "203.0.113.19" }] });
+    }
+    return sendRpcMethodMissing(response, payload.id, payload.method);
+  }
+
+  const requested = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+  const safePath = normalize(join(ROOT, requested));
+  const path = safePath.startsWith(normalize(ROOT)) && existsSync(safePath)
+    ? safePath
+    : join(ROOT, "index.html");
+  response.writeHead(200, {
+    "Content-Type": mime[extname(path)] ?? "application/octet-stream",
+    "Cache-Control": "no-store",
+    ...(fixture.reportWorkerFailure === "csp" && path.endsWith("index.html") ? {"Content-Security-Policy":"worker-src 'none'"}:{}),
+  });
+  createReadStream(path).pipe(response);
+});
+
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+const address = server.address();
+if (!address || typeof address === "string") throw new Error("fixture server did not bind TCP");
+const profile = mkdtempSync(join(tmpdir(), "blackwhite-browser-gate-"));
+const child = spawn(chrome, [
+  "--headless=new",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-background-networking",
+  "--disable-component-update",
+  "--disable-dev-shm-usage",
+  "--disable-sync",
+  // Allow WebGL fallback for these trusted local fixtures on GPU-less CI bots.
+  // Keep the default compositor: forcing the entire GLES driver to SwiftShader
+  // slows the existing DOM/Canvas2D long-poll stress test on hosted runners.
+  // https://chromium.googlesource.com/chromium/src/+/main/docs/gpu/swiftshader.md
+  ...(process.env.CI === "true" ? ["--enable-unsafe-swiftshader"] : []),
+  // Linux headless hosts can advertise no pointing device. Start with an
+  // explicit desktop mouse; the input gates separately emulate touch/reduced
+  // motion so they assert product behavior, not the runner's hardware.
+  "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2",
+  "--remote-debugging-address=127.0.0.1",
+  // Let Chromium select an unused port. It writes that port to
+  // DevToolsActivePort in this isolated profile, avoiding a flaky random-port
+  // collision on parallel CI jobs.
+  "--remote-debugging-port=0",
+  `--user-data-dir=${profile}`,
+  "about:blank",
+], { stdio: ["ignore", "ignore", "pipe"] });
+let chromeErrors = "";
+let chromeExit = null;
+let chromeLaunchError = null;
+child.stderr.on("data", (chunk) => { chromeErrors += chunk.toString(); });
+child.once("exit", (code, signal) => { chromeExit = { code, signal }; });
+child.once("error", (error) => { chromeLaunchError = error; });
+
+function readDevToolsPort() {
+  try {
+    const [rawPort] = readFileSync(join(profile, "DevToolsActivePort"), "utf8").trim().split(/\r?\n/, 1);
+    const port = Number(rawPort);
+    return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForDebugger() {
+  const deadline = Date.now() + DEVTOOLS_STARTUP_TIMEOUT_MS;
+  let port = null;
+  while (Date.now() < deadline) {
+    if (chromeLaunchError) {
+      throw new Error(`Chrome could not start: ${chromeLaunchError.message}`);
+    }
+    if (chromeExit) {
+      const exit = chromeExit.code ?? chromeExit.signal ?? "unknown";
+      throw new Error(`Chrome exited before DevTools started (${exit}): ${chromeErrors.slice(-1_000)}`);
+    }
+    port ??= readDevToolsPort();
+    if (!port) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      continue;
+    }
+    try {
+      const pages = await fetch(`http://127.0.0.1:${port}/json/list`, {
+        signal: AbortSignal.timeout(1_000),
+      }).then((result) => result.json());
+      const page = pages.find((item) => item.type === "page" && !String(item.url).startsWith("chrome-extension:"));
+      if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
+    } catch {
+      // Chromium has written the port but has not exposed a page yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `Chrome DevTools did not start within ${DEVTOOLS_STARTUP_TIMEOUT_MS}ms (port ${port ?? "not written"}): ${chromeErrors.slice(-1_000)}`,
+  );
+}
+
+class CDP {
+  constructor(url) {
+    this.socket = new WebSocket(url);
+    this.nextId = 0;
+    this.pending = new Map();
+    this.contexts = new Map();
+  }
+  async open() {
+    await new Promise((resolve, reject) => {
+      this.socket.addEventListener("open", resolve, { once: true });
+      this.socket.addEventListener("error", reject, { once: true });
+    });
+    this.socket.addEventListener("message", (event) => {
+      const message = JSON.parse(String(event.data));
+      if (message.method === "Runtime.executionContextCreated") this.contexts.set(`${message.sessionId || ""}:${message.params.context.id}`, { ...message.params.context, sessionId: message.sessionId });
+      if (message.method === "Runtime.executionContextDestroyed") this.contexts.delete(`${message.sessionId || ""}:${message.params.executionContextId}`);
+      if (message.method === "Runtime.executionContextsCleared") for (const [key, context] of this.contexts) if (context.sessionId === message.sessionId) this.contexts.delete(key);
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(`CDP ${pending.method}: ${message.error.message}`));
+      else pending.resolve(message.result);
+    });
+  }
+  call(method, params = {}, sessionId) {
+    const id = ++this.nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`CDP ${method} timed out`)); }, method === 'Page.printToPDF' ? 45000 : 30000);
+      this.pending.set(id, { method, resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
+      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+  }
+  async value(expression, contextId, sessionId) {
+    const result = await this.call("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true, ...(contextId ? { contextId } : {}) }, sessionId).catch(error => { throw new Error(`${error.message}: ${expression.slice(0, 250)}`); });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+    return result.result.value;
+  }
+  close() { this.socket.close(); }
+}
+
+async function waitUntil(cdp, expression, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // Chrome can expose an empty Document between Page.reload and the new
+    // root element. Keep waiting there without swallowing predicate errors.
+    if (await cdp.value(`document.documentElement !== null && (${expression})`)) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const diagnostics = await cdp.value(`({
+    text: document.body?.innerText?.slice(0, 600),
+    cards: document.querySelectorAll('.home-node-card-slot').length,
+    rows: document.querySelectorAll('.node-list-row').length,
+    url: location.href
+    , focus: document.activeElement?.outerHTML.slice(0, 800), switcher: document.querySelector('.node-search-switcher')?.outerHTML
+  })`);
+  throw new Error(`browser condition timed out: ${expression}; ${JSON.stringify(diagnostics)}`);
+}
+
+async function captureScreenshot(cdp, path, { waitForImages = true } = {}) {
+  if (waitForImages) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  const screenshot = await cdp.call("Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: false,
+  });
+  writeFileSync(path, Buffer.from(screenshot.data, "base64"));
+}
+
+// The legacy fixture holds one long-poll request open. Tear down the previous
+// document before switching `activeFixture`, otherwise a late request emitted
+// by the old page can be attributed to the next backend profile and turn a
+// real protocol assertion into a cross-navigation race.
+async function clearFixturePage(cdp) {
+  await cdp.call("Page.navigate", { url: "about:blank" });
+  await waitUntil(cdp, "location.href === 'about:blank'", 2_000);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+function failGate(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function resolveDateTimeLocalInZone(value, timeZone) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const target = match.slice(1).map(Number);
+  const targetAsUtc = Date.UTC(target[0], target[1] - 1, target[2], target[3], target[4]);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  let guess = targetAsUtc;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = Object.fromEntries(formatter.formatToParts(new Date(guess)).map((part) => [part.type, part.value]));
+    const actualAsUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+    const diff = targetAsUtc - actualAsUtc;
+    if (diff === 0) break;
+    guess += diff;
+  }
+  return new Date(guess).toISOString();
+}
+
+async function removeBrowserProfile(path) {
+  let lastError;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!["ENOTEMPTY", "EBUSY", "EPERM"].includes(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+    }
+  }
+  // Chrome helper processes can briefly recreate profile files after the main
+  // process exits. A leftover directory in the OS temp area must not turn an
+  // otherwise successful release gate into a product failure.
+  console.warn(`browser-scale-gates: could not remove temporary profile ${path}: ${lastError?.message ?? lastError}`);
+}
+
+function rpcRequests(run, method) {
+  return (requestPayloads.get(run) ?? []).filter((entry) => entry.method === method);
+}
+
+function assertNoRpcRequests(run, profileLabel, methods) {
+  const requests = requestPayloads.get(run) ?? [];
+  for (const method of methods) {
+    const countForMethod = requests.filter((entry) => entry.method === method).length;
+    failGate(
+      countForMethod === 0,
+      `${profileLabel} made incompatible RPC call ${method} (${countForMethod}x)`,
+    );
+  }
+}
+
+function assertOneNodeBatch(run, profileLabel, method, paramKey, nodes) {
+  const requests = rpcRequests(run, method);
+  failGate(
+    requests.length === 1,
+    `${profileLabel} expected one batched ${method} request, got ${requests.length}`,
+  );
+  const ids = requests[0]?.params?.[paramKey];
+  failGate(
+    Array.isArray(ids),
+    `${profileLabel} ${method} did not send ${paramKey} as an array`,
+  );
+  const expected = new Set(Array.from({ length: nodes }, (_, index) => `node-${index}`));
+  const actual = new Set(ids);
+  failGate(
+    actual.size === expected.size && [...expected].every((uuid) => actual.has(uuid)),
+    `${profileLabel} ${method} was not a complete ${nodes}-node batch`,
+  );
+}
+
+function assertLegacyRequestProfile(run, nodes) {
+  const profileLabel = BACKEND_PROFILES.legacy.label;
+  const counts = requestCounts.get(run) ?? {};
+  if ((counts.nodes ?? 0) !== 1) {
+    throw new Error(`${profileLabel} ${nodes}-node /api/nodes count=${counts.nodes ?? 0}`);
+  }
+  if ((counts["rpc:common:getPingOverview"] ?? 0) > 1) {
+    throw new Error(`${profileLabel} ${nodes}-node Ping overview fanned out`);
+  }
+  assertNoRpcRequests(run, profileLabel, OFFICIAL_ONLY_RPC_METHODS);
+}
+
+function assertOfficialRequestProfile(run, nodes) {
+  const profileLabel = BACKEND_PROFILES.official.label;
+  const counts = requestCounts.get(run) ?? {};
+  if ((counts.nodes ?? 0) !== 1) {
+    throw new Error(`${profileLabel} ${nodes}-node /api/nodes count=${counts.nodes ?? 0}`);
+  }
+
+  // The failed discovery probe is required by capability negotiation. After
+  // it, all data must come from upstream's batch current-status/metric APIs.
+  failGate(
+    rpcRequests(run, "rpc.discover").length === 1,
+    `${profileLabel} expected one rpc.discover negotiation probe`,
+  );
+  failGate(
+    rpcRequests(run, "rpc.methods").length === 1,
+    `${profileLabel} expected one rpc.methods capability request`,
+  );
+  assertOneNodeBatch(run, profileLabel, "common:getNodesLatestStatus", "uuids", nodes);
+  assertOneNodeBatch(run, profileLabel, "public:getPingMetricStats", "entity_ids", nodes);
+  failGate(
+    rpcRequests(run, "public:getPublicPingTasks").length === 1,
+    `${profileLabel} expected one public:getPublicPingTasks request`,
+  );
+
+  const metricBatches = rpcRequests(run, "public:queryMetrics");
+  const metricParams = metricBatches.find(({ params }) => params.metric_keys?.includes("ping.latency_ms"))?.params ?? {};
+  const trafficParams = metricBatches.find(({ params }) => params.metric_keys?.includes("net.total.up"))?.params;
+  failGate(metricBatches.length <= 2 && trafficParams && trafficParams.entity_ids?.length === nodes && Number(trafficParams.max_points) <= 250, `${profileLabel} daily traffic history was not bounded and batched`);
+  const metricKeys = metricParams.metric_keys;
+  failGate(
+    Array.isArray(metricKeys) &&
+      metricKeys.includes("ping.latency_ms") &&
+      metricKeys.includes("ping.loss") &&
+      Number(metricParams.max_points) === 24,
+    `${profileLabel} Ping metric request did not use the shared 24-point trend batch`,
+  );
+  failGate(
+    Number(rpcRequests(run, "public:getPingMetricStats")[0]?.params?.max_points) === 24,
+    `${profileLabel} Ping statistics request did not use the shared 24-point trend batch`,
+  );
+  assertNoRpcRequests(run, profileLabel, LEGACY_ONLY_RPC_METHODS);
+}
+
+const results = [];
+const docsDirectory = process.env.BROWSER_DOCS_SCREENSHOT_DIR;
+const crystalOnly = process.env.BROWSER_CRYSTAL_ONLY === "1";
+let cdp;
+const largeScaleBudgetMs = process.env.CI === "true" ? 16_000 : 12_000;
+try {
+  cdp = new CDP(await waitForDebugger());
+  await cdp.open();
+  await cdp.call("Page.enable");
+  await cdp.call("Runtime.enable");
+  await cdp.call("HeapProfiler.enable");
+  await cdp.call("Page.addScriptToEvaluateOnNewDocument", { source: `
+    window.__blackwhiteDefaultAppearanceWrites = 0;
+    const originalSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) {
+      if (key === 'appearance_default') window.__blackwhiteDefaultAppearanceWrites++;
+      return originalSetItem.call(this, key, value);
+    };
+  ` });
+
+  if (docsDirectory) {
+    mkdirSync(docsDirectory, { recursive: true });
+    const origin = `http://127.0.0.1:${address.port}`;
+    activeFixture = {backend: BACKEND_PROFILES.official.id, nodes: 4, aurora: true, crystal: true, luminousReference: true, workspaceMetrics: true, reports: true, network: true, comprehensive: true, ui: true, docs: true, run: "documentation", auroraHistoryPoints: 9, auroraQuotaFractions: [0.6, 0.32, null, 0.18]};
+    pointFixture.registeredNodes = ["node-0"];
+    savedUiSettings = {defaultAppearance: "crystal-light", showHomeOverview: true, showCostSummary: true};
+    const open = async (route, selector) => {
+      await cdp.call("Page.navigate", { url: origin + route });
+      await waitUntil(cdp, `document.querySelector(${JSON.stringify(selector)}) !== null`, 10000);
+    };
+    const select = (scope, label) => cdp.value(`[...document.querySelectorAll(${JSON.stringify(scope)})].find(el=>el.textContent.includes(${JSON.stringify(label)})).click()`);
+    const shot = async (name, selector) => {
+      if (selector) {
+        await cdp.value(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:"start"})`);
+      }
+      await cdp.value("document.fonts.ready.then(()=>true)");
+      await new Promise(resolve => setTimeout(resolve, 550));
+      const { data } = await cdp.call("Page.captureScreenshot", { format: "jpeg", quality: 88, captureBeyondViewport: false });
+      writeFileSync(join(docsDirectory, name + ".jpg"), Buffer.from(data, "base64"));
+    };
+    await cdp.call("Emulation.setDeviceMetricsOverride", { width: 1420, height: 980, deviceScaleFactor: 1, mobile: false });
+    await open("/", ".crystal-network-row");
+    await shot("home-light");
+    await cdp.value("localStorage.setItem('appearance', JSON.stringify('crystal-dark'))");
+    await open("/", ".crystal-network-row");
+    await shot("home-dark");
+    await cdp.value("localStorage.removeItem('appearance')");
+    await open("/instance/node-0?focus=ping", ".workspace-ping-summary");
+    await shot("instance");
+    await open("/compare?nodes=node-0,node-1", ".compare-hero, .compare-page, .compare-workspace");
+    await shot("compare");
+    await open("/?view=theme-manage", ".studio-visual-options input[value=crystal-light]");
+    await shot("studio");
+    const network = "/?view=theme-manage&section=network";
+    await open(network, ".studio-bindings");
+    await shot("network-overview");
+    await shot("ping-binding", ".studio-bindings");
+    await open(network + "&panel=routes", ".home-routes-publish");
+    await shot("publish", "#network-routes");
+    await open(network + "&panel=traffic-reset", "#network-ip-capability .report-checkbox");
+    await shot("capabilities", "#network-traffic-reset");
+    await open(network + "&panel=agents&nodes=node-0", ".measurement-install");
+    await shot("probe", "#network-agents");
+    await open(network + "&panel=targets", "#network-targets .network-form");
+    await shot("targets", "#network-targets");
+    await shot("measurement-point", ".measurement-points-panel");
+    await open(network + "&panel=plans&nodes=node-0", ".report-plan-steps");
+    await select(".report-preset-grid button", "TcpQuality 完整检测");
+    await shot("plan-modules", ".report-plan-module");
+    await select(".report-plan-steps button", "定时时间");
+    await shot("plan-schedule", ".report-plan-steps");
+    await select(".report-plan-steps button", "VPS 与覆盖");
+    await select(".report-plan-panel button", "预览每台");
+    await waitUntil(cdp, "document.querySelector('.report-coverage-preview details') !== null", 5000);
+    await shot("plan-coverage", ".report-execution-vps");
+    await open("/instance/node-0?focus=network", ".report-latency-card");
+    await shot("report");
+    await select(".report-main-tabs button", "大陆路由");
+    await waitUntil(cdp, "document.querySelector('.report-mtr-table') !== null", 5000);
+    await shot("report-routes", ".report-main-tabs");
+    await open("/instance/node-0/report", ".instance-report-form");
+    await cdp.value("document.querySelector('.instance-report-form button[type=submit]').click()");
+    await waitUntil(cdp, "document.querySelector('.instance-report-frame') !== null", 12000);
+    await shot("report-export");
+  } else {
+  if (!crystalOnly) {
+  if (!process.env.BROWSER_REPORT_GATES_ONLY) {
+  for (const backend of Object.values(BACKEND_PROFILES)) {
+    for (const [nodes, budgetMs] of [[30, 4_000], [300, 6_000], [1_000, largeScaleBudgetMs]]) {
+      const run = `${backend.id}-scale-${nodes}`;
+      await clearFixturePage(cdp);
+      activeFixture = { backend: backend.id, nodes, soak: false, run };
+      requestCounts.set(run, {});
+      requestPayloads.set(run, []);
+      await cdp.call("Page.navigate", {
+        url: `http://127.0.0.1:${address.port}/?fixture=${nodes}&backend=${backend.id}`,
+      });
+      await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === ${nodes}`, budgetMs);
+      await waitUntil(cdp, "document.querySelectorAll('.crystal-history').length > 0", budgetMs);
+      const metrics = await cdp.value(`(() => ({
+      renderMs: performance.now(),
+      defaultAppearanceWrites: window.__blackwhiteDefaultAppearanceWrites,
+      cards: document.querySelectorAll('.home-node-card-slot').length,
+      canvases: document.querySelectorAll('canvas').length,
+      activeCanvases: document.querySelectorAll('canvas[data-render-active="true"]').length,
+      pingTrendLines: document.querySelectorAll('.crystal-history').length,
+      emptyPingTrends: document.querySelectorAll('.crystal-history[data-empty=\"true\"]').length,
+      contentVisibility: getComputedStyle(document.querySelector('.home-node-card-slot')).contentVisibility,
+      bodyWidth: document.body.scrollWidth
+      , hiddenCostRows: document.querySelector('.cost-summary-panel[aria-hidden="true"]')?.querySelectorAll('.cost-summary-detail-item').length ?? 0
+    }))()`);
+      if (metrics.renderMs > budgetMs) throw new Error(`${backend.label} ${nodes}-node render ${metrics.renderMs}ms > ${budgetMs}ms`);
+      if (metrics.defaultAppearanceWrites > 2) throw new Error(`Appearance default written ${metrics.defaultAppearanceWrites} times for ${nodes} nodes`);
+      if (metrics.hiddenCostRows !== 0) throw new Error("Closed asset panel rendered fleet details during initial load");
+      if (nodes >= 300 && metrics.contentVisibility !== "auto") {
+        throw new Error(`${backend.label} ${nodes}-node browser card virtualization is disabled`);
+      }
+      if (nodes >= 300 && metrics.canvases > 0 && metrics.activeCanvases >= metrics.canvases) {
+        throw new Error(`${backend.label} ${nodes}-node browser did not suspend offscreen canvases`);
+      }
+      if (metrics.pingTrendLines === 0 || metrics.emptyPingTrends !== 0) {
+        throw new Error(`${backend.label} ${nodes}-node Ping trend regression: lines=${metrics.pingTrendLines}, empty=${metrics.emptyPingTrends}`);
+      }
+      if (backend === BACKEND_PROFILES.legacy) assertLegacyRequestProfile(run, nodes);
+      else assertOfficialRequestProfile(run, nodes);
+      results.push({ backend: backend.id, nodes, ...metrics, requests: requestCounts.get(run) ?? {} });
+    }
+  }
+
+  const soakRun = `${BACKEND_PROFILES.legacy.id}-soak-30`;
+  await clearFixturePage(cdp);
+  activeFixture = {
+    backend: BACKEND_PROFILES.legacy.id,
+    nodes: 30,
+    soak: true,
+    run: soakRun,
+  };
+  requestCounts.set(activeFixture.run, {});
+  requestPayloads.set(activeFixture.run, []);
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=30&soak=1&backend=${BACKEND_PROFILES.legacy.id}` });
+  await waitUntil(cdp, "document.querySelectorAll('.home-node-card-slot').length === 30", 4_000);
+  await cdp.call("HeapProfiler.collectGarbage");
+  const heapBefore = await cdp.call("Runtime.getHeapUsage");
+  const soakDeadline = Date.now() + SOAK_TIMEOUT_MS;
+  while ((requestCounts.get(soakRun)?.["rpc:common:getRealtimeDelta"] ?? 0) < SOAK_TICK_TARGET && Date.now() < soakDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const completedSoakTicks = requestCounts.get(soakRun)?.["rpc:common:getRealtimeDelta"] ?? 0;
+  if (completedSoakTicks < SOAK_TICK_TARGET) {
+    throw new Error(`browser soak did not finish: ${completedSoakTicks}/${SOAK_TICK_TARGET} long-poll turns in ${SOAK_TIMEOUT_MS}ms`);
+  }
+  await cdp.call("HeapProfiler.collectGarbage");
+  const heapAfter = await cdp.call("Runtime.getHeapUsage");
+  const heapGrowth = heapAfter.usedSize - heapBefore.usedSize;
+  if (heapGrowth > 16 * 1024 * 1024) throw new Error(`browser soak heap grew ${heapGrowth} bytes`);
+  assertLegacyRequestProfile(soakRun, 30);
+  results.push({ backend: BACKEND_PROFILES.legacy.id, soakTicks: SOAK_TICK_TARGET, heapBefore: heapBefore.usedSize, heapAfter: heapAfter.usedSize, heapGrowth });
+
+  await clearFixturePage(cdp);
+  activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, soak: false, run: "traffic-summary", ui: true, trafficSummary: true };
+  await cdp.call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await cdp.call("Emulation.setFocusEmulationEnabled", { enabled: true });
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=3&backend=${BACKEND_PROFILES.official.id}` });
+  await waitUntil(cdp, `document.querySelector('[data-home-overview-trigger="traffic"] .cupertino-resource-footer b')?.textContent.startsWith('≈')`, 6_000);
+  failGate(await cdp.value(`document.querySelector('[data-home-overview-trigger="traffic"]').title.includes('2/3')`), 'partial fleet total did not expose its coverage');
+  await cdp.value(`document.querySelector('[data-home-overview-trigger="traffic"]').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.home-overview-panel.show .home-overview-row').length===3`, 2_000);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.home-overview-panel.show .home-overview-row-value strong')).filter(el=>el.textContent!=='—').length===2`), 'traffic total and ranking disagreed about available nodes');
+  await cdp.value(`document.querySelector('.home-overview-panel.show .home-overview-close').click()`);
+  for (const [field, label] of [['trafficEmpty', '待计算'], ['trafficFailure', '读取失败']]) {
+    await clearFixturePage(cdp);
+    activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, ui: true, trafficSummary: true, [field]: true, run: field };
+    await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=3&backend=${BACKEND_PROFILES.official.id}` });
+    await waitUntil(cdp, `document.querySelector('[data-home-overview-trigger="traffic"] .cupertino-resource-footer b')?.textContent===${JSON.stringify(label)}`, 8_000);
+  }
+  await clearFixturePage(cdp);
+  activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, soak: false, run: "ui-regressions", ui: true, quotaUsage: true };
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=3&backend=${BACKEND_PROFILES.official.id}&status=attention` });
+  await waitUntil(cdp, `document.querySelector('.home-ops-panel .home-ops-item') !== null`, 6_000);
+  const compactOperations = await cdp.value(`(() => ({ compact: document.querySelector('.home-ops-panel')?.dataset.compact, href: document.querySelector('.home-ops-panel .home-ops-item')?.getAttribute('href'), text: document.querySelector('.home-ops-panel .home-ops-item')?.textContent }))()`);
+  failGate(
+    compactOperations.compact === "true" && /\?focus=(status|ping|traffic|expiry|cpu|ram|disk)$/.test(compactOperations.href ?? ""),
+    `compact operations summary did not remain visible or link to Ping evidence: ${JSON.stringify(compactOperations)}`,
+  );
+  await cdp.value(`document.querySelector('.home-ops-show-all')?.click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.home-ops-panel .home-ops-item').length > 1`, 2_000);
+  await cdp.call("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=3&backend=${BACKEND_PROFILES.official.id}&status=attention` });
+  await waitUntil(cdp, `document.querySelector('.crystal-resources') !== null`, 6000);
+  failGate(await cdp.value(`document.documentElement.scrollWidth <= innerWidth + 1 &&
+    document.querySelector('.cupertino-home-search input').getBoundingClientRect().height > 0 &&
+    document.querySelector('.crystal-resources').getBoundingClientRect().width > 0`),
+    "mobile inspection layout is hidden or overflows");
+  await cdp.call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?fixture=3&backend=${BACKEND_PROFILES.official.id}&status=attention` });
+  await waitUntil(cdp, `document.querySelector('.home-ops-panel .home-ops-item') !== null`, 6_000);
+  await cdp.value(`document.querySelector('.home-ops-panel .home-ops-item')?.click()`);
+  await waitUntil(cdp, `location.pathname === '/instance/node-0' && new URLSearchParams(location.search).has('focus')`, 4_000);
+  await waitUntil(cdp, `document.querySelector('#instance-summary') !== null`, 4_000);
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/instance/node-0` });
+  await waitUntil(cdp, `Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === 'Ping')`, 6_000);
+  const loadRangeLabels = await cdp.value(`Array.from(document.querySelectorAll('.instance-chart-controls .instance-segmented.is-scrollable button')).map(button => button.textContent.trim())`);
+  failGate(loadRangeLabels.filter((label) => label === "1 月").length === 1, "load chart did not expose exactly one 1-month range");
+  failGate(!loadRangeLabels.includes("30 天") && !loadRangeLabels.includes("31 天"), "load chart still exposes duplicate 30/31-day ranges");
+  failGate(loadRangeLabels.includes("自定义"), "load chart custom range control is missing");
+  await cdp.value(`Array.from(document.querySelectorAll('.instance-chart-controls .instance-segmented.is-scrollable button')).find(button => button.textContent.trim() === '自定义').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('input[type="datetime-local"]').length === 2`, 2_000);
+  await cdp.value(`(() => {
+    const inputs = document.querySelectorAll('input[type="datetime-local"]');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(inputs[0], '2026-08-01T18:00'); inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+    setter.call(inputs[1], '2026-08-02T00:00'); inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const customRangeZone = await cdp.value(`(() => {
+    const label = Array.from(document.querySelectorAll('label')).find(item => item.textContent.includes('开始时间'))?.textContent ?? '';
+    const selectedZone = label.match(/开始时间（([^）]+)）/)?.[1] ?? '';
+    return selectedZone.includes('跟随浏览器') ? Intl.DateTimeFormat().resolvedOptions().timeZone : selectedZone.match(/\(([^)]+)\)/)?.[1] ?? selectedZone;
+  })()`);
+  const expectedCustomStart = resolveDateTimeLocalInZone("2026-08-01T18:00", customRangeZone);
+  const expectedCustomEnd = resolveDateTimeLocalInZone("2026-08-02T00:00", customRangeZone);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.trim() === '应用时间范围').click()`);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  failGate(rpcRequests("ui-regressions", "public:queryMetrics").some(({ params }) => Array.isArray(params.metric_keys) && params.metric_keys.includes("cpu.usage") && params.start === expectedCustomStart && params.end === expectedCustomEnd), "custom load range was not sent in the selected display time zone");
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    await captureScreenshot(cdp, `${process.env.BROWSER_GATE_SCREENSHOT}.load-custom.png`);
+  }
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Ping').click()`);
+  await waitUntil(cdp, `document.querySelector('.instance-ping-task') !== null`, 6_000);
+  failGate(await cdp.value(`document.querySelector('[aria-label="Ping 线路筛选"] button:nth-child(2)')?.getAttribute('aria-pressed') === 'true'`), 'Ping chart did not default to all routes');
+  await waitUntil(cdp, `document.querySelector('.instance-ping-panel .uplot canvas') !== null`, 6_000);
+  const pingBeforeHover = await cdp.value(`document.querySelector('.instance-ping-panel .uplot canvas').toDataURL()`);
+  await cdp.value(`document.querySelector('.instance-ping-task-row').dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))`);
+  await waitUntil(cdp, `document.querySelector('.instance-ping-panel .uplot canvas').toDataURL() !== ${JSON.stringify(pingBeforeHover)}`, 3_000);
+  await cdp.value(`document.querySelector('.instance-ping-task-row').dispatchEvent(new MouseEvent('mouseout', { bubbles: true }))`);
+  await waitUntil(cdp, `document.querySelector('.instance-ping-panel .uplot canvas').toDataURL() === ${JSON.stringify(pingBeforeHover)}`, 3_000);
+  for (const label of ["6 小时", "1 天", "7 天", "1 月", "自定义"]) {
+    await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === ${JSON.stringify(label)}).click()`);
+    if (label !== "自定义") {
+      await waitUntil(cdp, `Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === ${JSON.stringify(label)} && b.dataset.active === 'true')`, 6_000);
+    }
+    await waitUntil(cdp, `document.querySelector('.instance-chart-view:not([hidden]) .uplot canvas') !== null`, 6_000);
+    if (label === "7 天" || label === "1 月") {
+      await waitUntil(cdp, `(() => {
+        const chart = document.querySelector('.instance-chart-view:not([hidden]) .instance-uplot-wrap');
+        const start = Number(chart?.dataset.windowStart);
+        const end = Number(chart?.dataset.windowEnd);
+        return chart?.dataset.queryHours === '24' &&
+          chart?.dataset.retentionLimited === 'true' &&
+          Math.abs((end - start) - ${24 * 3_600}) < 2;
+      })()`, 6_000);
+      failGate(
+        await cdp.value(`document.querySelector('.instance-ping-retention-notice')?.textContent.includes('只保留 24 小时') === true`),
+        `${label} Ping range did not explain the 24-hour server retention limit`,
+      );
+    }
+    if (label === "1 月" && process.env.BROWSER_GATE_SCREENSHOT) {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+      writeFileSync(`${process.env.BROWSER_GATE_SCREENSHOT}.ping.png`, Buffer.from(screenshot.data, "base64"));
+    }
+  }
+  failGate(
+    rpcRequests("ui-regressions", "public:queryMetrics").some(({ params }) => {
+      const start = Date.parse(String(params.start));
+      const end = Date.parse(String(params.end));
+      return Number(params.max_points) === 160 && Math.abs(end - start - 24 * 3_600_000) < 2_000;
+    }),
+    "retention-limited Ping history did not request the available 24-hour slice at full density",
+  );
+  await waitUntil(cdp, `document.querySelectorAll('input[type="datetime-local"]').length === 2`, 2_000);
+  await cdp.value(`(() => {
+    const inputs = document.querySelectorAll('input[type="datetime-local"]');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(inputs[0], '2026-08-01T18:00'); inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+    setter.call(inputs[1], '2026-08-02T00:00'); inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const pingRangeZone = await cdp.value(`(() => {
+    const label = Array.from(document.querySelectorAll('label')).find(item => item.textContent.includes('开始时间'))?.textContent ?? '';
+    const selectedZone = label.match(/开始时间（([^）]+)）/)?.[1] ?? '';
+    return selectedZone.includes('跟随浏览器') ? Intl.DateTimeFormat().resolvedOptions().timeZone : selectedZone.match(/\(([^)]+)\)/)?.[1] ?? selectedZone;
+  })()`);
+  const expectedPingStart = resolveDateTimeLocalInZone("2026-08-01T18:00", pingRangeZone);
+  const expectedPingEnd = resolveDateTimeLocalInZone("2026-08-02T00:00", pingRangeZone);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '应用时间范围').click()`);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  failGate(rpcRequests("ui-regressions", "public:queryMetrics").some(({ params }) => params.start === expectedPingStart && params.end === expectedPingEnd), "custom Ping range was not sent in the selected display time zone");
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?view=theme-manage` });
+  await waitUntil(cdp, `document.querySelector('input[aria-label="搜索要配置的 VPS"]') !== null`, 6_000);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-time-editor input[type="search"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '上海'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-time-options input').length === 1`, 2_000);
+  await cdp.value(`document.querySelector('.studio-time-options input').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-time-detail input').value === 'Asia/Shanghai'`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  const storageBeforePreview = await cdp.value(`JSON.stringify(Object.entries(localStorage).sort())`);
+  failNextPreviewDocument = true;
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '打开首页预览').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-preview-status').textContent.includes('预览尚未响应')`, 11_000);
+  await cdp.value(`document.querySelector('.studio-preview-status button').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-preview-status').textContent.includes('草稿已同步')`, 6_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '关闭预览').click()`);
+
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '打开首页预览').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe')?.contentDocument?.querySelectorAll('.home-node-card-slot').length === 3`, 8_000);
+  await waitUntil(cdp, `document.querySelector('.studio-preview-status').textContent.includes('草稿已同步')`, 4_000);
+  await cdp.value(`document.querySelector('.studio-home-preview iframe').dataset.originalFrame = 'true'; document.querySelector('.studio-preview-status button').click()`);
+  await waitUntil(cdp, `!document.querySelector('.studio-home-preview iframe').dataset.originalFrame && document.querySelector('.studio-preview-status').textContent.includes('草稿已同步')`, 6_000);
+  await cdp.value(`document.querySelector('.studio-visual-options input[value="crystal-dark"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe')?.contentDocument?.documentElement?.dataset.appearance === 'dark'`, 4_000);
+  failGate(await cdp.value(`JSON.stringify(Object.entries(localStorage).sort())`) === storageBeforePreview, 'preview changed outer storage');
+  await cdp.value(`document.querySelector('.studio-device-layouts fieldset input[value="list"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe').contentDocument.querySelectorAll('.node-list-row:not(.is-loading)').length === 3`, 4_000);
+  await cdp.value(`document.querySelector('.studio-device-layouts fieldset input[value="compact"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe').contentDocument.querySelectorAll('.home-node-card-slot').length === 3`, 4_000);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-background-controls input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '/images/logo/linux.svg'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe').contentDocument.documentElement.style.getPropertyValue('--bg-image-desktop').includes('/images/logo/linux.svg')`, 4_000);
+  failGate(await cdp.value(`JSON.stringify(Object.entries(localStorage).sort())`) === storageBeforePreview, 'background preview polluted outer cache');
+  if (process.env.STUDIO_PREVIEW_SCREENSHOT) {
+    await cdp.value(`document.querySelector('.studio-home-preview').scrollIntoView({ block: 'start' })`);
+    await captureScreenshot(cdp, process.env.STUDIO_PREVIEW_SCREENSHOT);
+  }
+
+  await cdp.value(`document.querySelectorAll('[aria-label="首页预览设备"] button')[1].click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe').contentWindow.innerWidth === 390`, 3_000);
+  await cdp.value(`document.querySelectorAll('.studio-device-layouts fieldset')[1].querySelector('input[value="list"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-home-preview iframe').contentDocument.querySelectorAll('.node-list-row:not(.is-loading)').length === 3`, 4_000);
+
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '关闭预览').click()`);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-background-controls input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '/studio-retry.svg'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '加载当前背景预览').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-background-preview [role="status"]').textContent.includes('图片未能加载')`, 3_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '加载当前背景预览').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-background-canvas img')?.naturalWidth === 20`, 3_000);
+  failGate(backgroundAttempts >= 2, 'background retry did not issue a new request');
+  await cdp.value(`(() => { const input = document.querySelector('.studio-background-controls input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '/images/logo/linux.svg'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '加载当前背景预览').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-background-canvas img')?.complete && document.querySelector('.studio-background-canvas img').naturalWidth > 0`, 3_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '移动背景').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-background-canvas').dataset.device === 'mobile'`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await waitUntil(cdp, `!document.querySelector('.studio-background-canvas img')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('资产与成本')).click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-asset-editor')?.getClientRects().length > 0`, 2_000);
+  await cdp.value(`document.querySelector('.studio-asset-editor .studio-scope-list input[type="checkbox"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.blackwhite-studio-state').textContent.includes('未保存')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await waitUntil(cdp, `!document.querySelector('.studio-asset-editor .studio-scope-list input[type="checkbox"]').checked`, 2_000);
+  await cdp.value(`document.querySelector('.studio-asset-advanced summary').click()`);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-rate-input input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'invalid-address'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await waitUntil(cdp, `document.querySelector('.studio-rate-input input').getAttribute('aria-invalid') === 'true' && Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '保存设置').disabled`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-rate-input input').getAttribute('aria-invalid') === 'false'`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('节点与视图')).click()`);
+  await waitUntil(cdp, `document.activeElement === document.querySelector('.blackwhite-studio-heading h1')`, 2_000);
+  failGate(await cdp.value(`document.querySelector('.blackwhite-studio-heading h1').getBoundingClientRect().top >= 0`), 'section heading is outside viewport after navigation');
+  const initialDimensionCount = await cdp.value(`document.querySelectorAll('.studio-dimensions ol > li').length`);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.studio-dimensions ol > li')).every(row => row.querySelector('.studio-drag-handle')?.draggable)`), 'dimension ordering is missing draggable handles');
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-dimensions button')).find(b => b.textContent.includes('新增维度')).click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-dimensions ol > li').length === ${initialDimensionCount + 1}`, 2_000);
+  await cdp.value(`(() => { const select = document.querySelector('.studio-dimension-default select'); select.value = select.options[select.options.length - 1].value; select.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-dimensions ol > li:last-child button')).find(b => b.textContent === '删除').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-dimension-removal') !== null`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-dimension-removal button')).find(b => b.textContent.includes('删除维度及关联配置')).click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-dimensions ol > li').length === ${initialDimensionCount}`, 2_000);
+  failGate(await cdp.value(`document.querySelector('.studio-dimension-default select').value === 'legacyGroup'`), 'deleted default dimension did not fall back');
+  await cdp.value(`(() => { const input = document.querySelector('.blackwhite-studio-nav input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'ping'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await waitUntil(cdp, `document.querySelector('input[aria-label="搜索要配置的 VPS"]').getClientRects().length > 0`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('节点与视图')).click()`);
+
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '新增视图').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-saved-view') !== null`, 2_000);
+  await waitUntil(cdp, `document.querySelector('.studio-saved-view').open && document.activeElement === document.querySelector('.studio-saved-view input[aria-label^="重命名视图"]')`, 2_000);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-saved-view input[aria-label^="重命名视图"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '日常巡检'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-sort-editor header button')).find(b => b.textContent.includes('添加条件')).click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-sort-editor li').length === 2`, 2_000);
+  const initialSortOrder = await cdp.value(`Array.from(document.querySelectorAll('.studio-sort-editor li select:first-of-type')).map(s => s.value)`);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.studio-sort-editor li')).every(row => row.querySelector('.studio-drag-handle')?.draggable)`), 'saved-view ordering is missing draggable handles');
+  await cdp.value(`document.querySelectorAll('.studio-sort-actions')[1].querySelector('button').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-sort-editor [role="status"]').textContent.includes('第 1 优先级')`, 2_000);
+  failGate(await cdp.value(`document.querySelector('.studio-sort-editor li select').value`) !== initialSortOrder[0], 'sort priority did not change');
+  await cdp.value(`(() => { const select = document.querySelector('.studio-saved-view select[aria-label="添加筛选维度"]'); select.value = 'region'; select.dispatchEvent(new Event('change', { bubbles: true })); const input = document.querySelector('.studio-saved-view input[aria-label="新条件的匹配值"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'US'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-saved-view .studio-scope button')).find(b => b.textContent.trim() === '添加条件').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-saved-view input[aria-label="地区 的匹配值"]') !== null`, 2_000);
+  await cdp.value(`(() => { const input = document.querySelector('.studio-saved-view input[aria-label="地区 的匹配值"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'US; JP; '); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  failGate(await cdp.value(`document.querySelector('.studio-saved-view input[aria-label="地区 的匹配值"]').value === 'US; JP; '`), 'filter editing discarded punctuation');
+  await cdp.value(`document.querySelector('.studio-saved-view .studio-scope-list input').click()`);
+  await waitUntil(cdp, `document.querySelector('.studio-saved-view summary').textContent.includes('1 台指定节点')`, 2_000);
+  await cdp.value(`(() => { const field = Array.from(document.querySelectorAll('.studio-tag-field')).find(e => e.querySelector('label').textContent === 'Scale Node 0 · 厂商'); const input = field.querySelector('input'); input.focus(); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'Blackwhite Test'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await cdp.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await waitUntil(cdp, `document.querySelector('.studio-tag-values').parentElement.parentElement.innerText.includes('Blackwhite Test')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('巡检与指标')).click()`);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.studio-group-order li')).every(row => row.querySelector('.studio-drag-handle')?.draggable)`), 'group ordering is missing draggable handles');
+  await cdp.value(`(() => { const toggle = document.querySelector('.studio-rating-editor > .studio-setting-switch input'); if (!toggle.checked) toggle.click(); })()`);
+  await waitUntil(cdp, `!document.querySelector('.studio-rating-editor fieldset').disabled`, 2_000);
+  await cdp.value(`(() => { const input = document.querySelector('input[aria-label="今日流量 第 2 级名称"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '日常负载'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await waitUntil(cdp, `document.querySelector('input[aria-label="今日流量 第 2 级名称"]').value === '日常负载'`, 2_000);
+  failGate(await cdp.value(`document.querySelector('.studio-change-summary').textContent.includes('保存视图')`), 'change summary omits edited views');
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('网络观测')).click()`);
+  await waitUntil(cdp, `document.querySelector('input[aria-label="搜索要配置的 VPS"]').getClientRects().length > 0`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '选择当前结果').click()`);
+  await waitUntil(cdp, `document.body.innerText.includes('批量配置 3 台 VPS')`, 2_000);
+  await cdp.value(`(() => { const title = Array.from(document.querySelectorAll('strong')).find(e => e.textContent === '批量配置 3 台 VPS'); title.parentElement.querySelectorAll('input[type="checkbox"]').forEach(e => e.click()); })()`);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.studio-binding-batch [data-reorder-id]')).every(row => row.querySelector('.studio-drag-handle')?.draggable)`), 'batch task ordering is missing draggable handles');
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    await cdp.value(`document.querySelector('.studio-binding-batch').scrollIntoView({ block: 'start' })`);
+    await captureScreenshot(cdp, `${process.env.BROWSER_GATE_SCREENSHOT}.drag-ordering.png`, { waitForImages: false });
+  }
+  await cdp.value(`document.querySelector('button[aria-label="上移 Task 6"]').click()`);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '替换所选 VPS 的任务').click()`);
+  await cdp.value(`Array.from(document.querySelectorAll('summary')).find(e => e.textContent.includes('汇总策略')).click()`);
+  await cdp.value(`document.querySelectorAll('.studio-network-strategy input')[1].click()`);
+  await cdp.value(`(() => { const select = document.querySelector('select[aria-label="设置 Scale Node 0 的首页 Ping 主任务"]'); select.value = '6'; select.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+  await cdp.value(`(() => { const input = document.querySelector('input[aria-label="设置 Task 6 的展示分组"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '国际线路'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await cdp.value(`(()=>{const select=document.querySelector('[aria-label="报告结果图片样式"]');select.value='original';select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  rejectNextStudioSave = true;
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '保存设置').click()`);
+  await waitUntil(cdp, `document.body.innerText.includes('草稿已保留')`, 4_000);
+  failGate(await cdp.value(`document.querySelector('.blackwhite-studio') !== null && document.querySelector('input[aria-label="今日流量 第 2 级名称"]').value === '日常负载'`), 'permission failure discarded the draft');
+  let releaseStudioSave;
+  studioSaveBarrier = new Promise(resolve => { releaseStudioSave = resolve; });
+
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '保存设置').click()`);
+  await waitUntil(cdp, `document.body.innerText.includes('保存中')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('巡检与指标')).click()`);
+  await cdp.value(`(() => { const input = document.querySelector('input[aria-label="今日流量 第 2 级名称"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '保存中继续编辑'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  releaseStudioSave();
+  studioSaveBarrier = null;
+  await waitUntil(cdp, `document.body.innerText.includes('新修改仍在草稿中')`, 4_000);
+  failGate(await cdp.value(`document.querySelector('input[aria-label="今日流量 第 2 级名称"]').value === '保存中继续编辑'`), 'inflight edit was overwritten');
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('网络观测')).click()`);
+  await waitUntil(cdp, `document.body.innerText.includes('保存成功') || document.body.innerText.includes('已保存')`, 6_000);
+  failGate(Object.values(savedUiSettings?.homepagePingTaskOrder ?? {}).filter(ids => ids.length === 6).length === 3, "batch VPS task configuration was not saved");
+  failGate(savedUiSettings.homepagePingTaskOrder["node-0"].join() === "1,2,3,4,6,5", "configured order was lost on save");
+  failGate(savedUiSettings.homepagePingAggregationStrategy === 'primary' && savedUiSettings.homepagePingPrimaryTasks['node-0'] === 6 && savedUiSettings.homepagePingTaskGroups['6'] === '国际线路', 'network presentation settings did not persist');
+  await waitUntil(cdp, `document.querySelector('.studio-diagnostics[aria-label="网络配置检查"] button[aria-expanded="false"]') !== null`, 2_000);
+  failGate(await cdp.value(`document.querySelectorAll('.studio-diagnostics[aria-label="网络配置检查"] li').length === 6`), 'diagnostics initial limit is wrong');
+  await cdp.value(`document.querySelector('.studio-diagnostics[aria-label="网络配置检查"] button').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-diagnostics[aria-label="网络配置检查"] li').length === 18`, 2_000);
+  await cdp.value(`document.querySelector('.studio-diagnostics[aria-label="网络配置检查"] button').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.studio-diagnostics[aria-label="网络配置检查"] li').length === 6`, 2_000);
+  failGate(savedUiSettings.homeSavedViews.find(view => view.name === '日常巡检').sorts.length === 2, 'saved view sort priority was not persisted');
+  failGate(savedUiSettings.homeSavedViews.find(view => view.name === '日常巡检').filters.region.join() === 'US,JP', 'filter edits were not persisted without blur');
+  failGate(savedUiSettings.homeSavedViews.some(view => view.name === '日常巡检' && view.selectedNodeUuids.join() === 'node-0'), 'saved view scope was not persisted');
+  failGate(savedUiSettings.homeNodeFacets['node-0'].provider.includes('Blackwhite Test'), 'tag edit was not saved');
+  failGate(savedUiSettings.trafficRatingLabels.split(',').length === 4 && savedUiSettings.trafficRatingLabels.split(',')[1] === '日常负载', 'rating levels were lost on save');
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await waitUntil(cdp, `document.querySelector('input[aria-label="今日流量 第 2 级名称"]').value === '日常负载' && !document.querySelector('.studio-change-summary')`, 2_000);
+
+  await cdp.call("Page.reload");
+  await waitUntil(cdp, `document.querySelector('.blackwhite-studio-nav button') !== null`, 6_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('网络观测')).click()`);
+  await waitUntil(cdp, `document.querySelector('input[aria-label="搜索要配置的 VPS"]') !== null && document.body.innerText.includes('Task 4 → Task 6 → Task 5')`, 6_000);
+  failGate(await cdp.value(`document.querySelector('[aria-label="报告结果图片样式"]').value==='original'`), 'report style preference did not survive save/reload');
+  failGate(await cdp.value(`document.querySelector('input[aria-label="今日流量 第 2 级名称"]').value === '日常负载'`), 'rating label did not survive reload');
+  failGate(await cdp.value(`document.querySelector('.studio-saved-view summary').textContent.includes('日常巡检') && document.querySelector('.studio-saved-view summary').textContent.includes('1 台指定节点')`), 'saved view summary did not recover');
+
+  failGate(await cdp.value(`document.querySelector('select[aria-label="设置 Scale Node 0 的首页 Ping 主任务"]').value === '6' && document.querySelector('input[aria-label="设置 Task 6 的展示分组"]').value === '国际线路' && document.querySelectorAll('.studio-network-strategy input')[1].checked`), 'network presentation settings did not reload');
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-bindings button')).find(b => b.textContent === '选择当前结果').click()`);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-binding-batch button')).find(b => b.textContent === '替换所选 VPS 的任务').click()`);
+  await waitUntil(cdp, `Array.from(document.querySelectorAll('.studio-binding-node')).every(e => e.innerText.includes('未配置'))`, 2_000);
+  await cdp.value(`document.querySelector('.studio-binding-batch .studio-task-catalog input').click()`);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-binding-batch button')).find(b => b.textContent === '追加任务').click()`);
+  await waitUntil(cdp, `Array.from(document.querySelectorAll('.studio-binding-node')).every(e => e.querySelector('p')?.textContent === 'Task 1')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent === '撤销修改').click()`);
+  await waitUntil(cdp, `Array.from(document.querySelectorAll('.studio-binding-node')).every(e => e.querySelector('p')?.textContent.includes('Task 4 → Task 6 → Task 5'))`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.studio-bindings button')).find(b => b.textContent === '取消选择').click()`);
+
+
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('节点与视图')).click()`);
+  await waitUntil(cdp, `Array.from(document.querySelectorAll('.studio-tag-field')).find(e => e.querySelector('label').textContent === 'Scale Node 0 · 厂商').innerText.includes('Blackwhite Test')`, 2_000);
+  await cdp.value(`document.querySelector('button[aria-label="移除 Scale Node 0 · 厂商 标签 Blackwhite Test"]').click()`);
+  await waitUntil(cdp, `!document.querySelector('button[aria-label="移除 Scale Node 0 · 厂商 标签 Blackwhite Test"]')`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '撤销修改').click()`);
+  await waitUntil(cdp, `document.querySelector('button[aria-label="移除 Scale Node 0 · 厂商 标签 Blackwhite Test"]') !== null`, 2_000);
+  await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-nav button')).find(b => b.textContent.includes('网络观测')).click()`);
+
+
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    await cdp.value(`document.querySelector('input[aria-label="搜索要配置的 VPS"]').scrollIntoView({ block: 'start' })`);
+    const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+    writeFileSync(`${process.env.BROWSER_GATE_SCREENSHOT}.editor.png`, Buffer.from(screenshot.data, "base64"));
+  }
+  activeFixture.dailyVisual = true;
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/` });
+  await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 3 && document.querySelectorAll('.crystal-network-row').length === 18`, 6_000);
+  await waitUntil(cdp, `document.querySelectorAll('.crystal-quota-track').length === 3`, 6000);
+  failGate(await cdp.value(`[...document.querySelectorAll('.crystal-quota-track')].every(track=>track.children.length===35)`),
+    'Crystal quota did not render its usage scale');
+  if (process.env.BROWSER_GATE_SCREENSHOT) await captureScreenshot(cdp, `${process.env.BROWSER_GATE_SCREENSHOT}.traffic-quota.png`);
+  await cdp.value(`document.querySelector('.cupertino-home-search input').focus()`);
+  await cdp.call('Input.insertText',{text:'2 scale'});
+  await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 1 && document.querySelector('.home-node-card-slot').textContent.includes('Scale Node 2')`, 2_000);
+  await cdp.value(`document.querySelector('.cupertino-home-search input').focus();document.querySelector('.cupertino-home-search input').select()`);
+  await cdp.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});
+  await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 3`, 2_000);
+  await waitUntil(cdp, `document.querySelectorAll('.crystal-network-row').length === 18`, 2_000);
+  failGate(await cdp.value(`Array.from(document.querySelectorAll('.home-node-card-slot')[0].querySelectorAll('.crystal-network-name')).map(e => e.textContent).join() === 'Task 1,Task 2,Task 3,Task 4,Task 6,Task 5'`), "card did not preserve all six configured tasks in order");
+  const facetBefore = await cdp.value(`Array.from(document.querySelectorAll('.home-facet-rail button')).map(e => e.querySelector('span')?.textContent)`);
+  await cdp.value(`Array.from(document.querySelectorAll('.home-facet-rail button')).find(e => e.textContent.includes('Group 2')).click()`);
+  failGate(JSON.stringify(await cdp.value(`Array.from(document.querySelectorAll('.home-facet-rail button')).map(e => e.querySelector('span')?.textContent)`)) === JSON.stringify(facetBefore), "selected facet moved from its position");
+  await cdp.value(`document.querySelector('button[title="地区：R1"]').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 0`, 2_000);
+  failGate(await cdp.value(`document.querySelector('button[title="分组：Group 2"]').getAttribute('aria-selected') === 'true'`), "cross-category empty results silently cleared group");
+  await cdp.value(`document.querySelector('button[title="地区：R2"]').click()`);
+  await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 1`, 2_000);
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+    writeFileSync(`${process.env.BROWSER_GATE_SCREENSHOT}.facets.png`, Buffer.from(screenshot.data, "base64"));
+  }
+  activeFixture.comprehensive = true;
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/instance/node-0` });
+  await waitUntil(cdp, `document.querySelector('input[aria-label="搜索并切换 VPS"]') !== null`, 6_000);
+  await waitUntil(cdp, `[...document.querySelectorAll('.instance-chart-controls button')].some(button=>button.textContent.trim()==='1 小时')`, 4000);
+  await cdp.value(`[...document.querySelectorAll('.instance-chart-controls button')].find(button=>button.textContent.trim()==='1 小时').click()`);
+  await waitUntil(cdp, `document.querySelector('.instance-uplot-wrap canvas') !== null`, 6_000);
+  await cdp.value(`document.querySelector('input[aria-label="搜索并切换 VPS"]').focus()`);
+  await waitUntil(cdp, `document.querySelectorAll('.node-switch-results [role="option"]').length === 3`, 4_000);
+  await cdp.call("Input.insertText", { text: "2 scale" });
+  await waitUntil(cdp, `document.querySelectorAll('.node-switch-results [role="option"]').length === 1`, 2_000);
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+    writeFileSync(`${process.env.BROWSER_GATE_SCREENSHOT}.search.png`, Buffer.from(screenshot.data, "base64"));
+  }
+  await cdp.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await waitUntil(cdp, `location.pathname === '/instance/node-2'`, 4_000);
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+    writeFileSync(process.env.BROWSER_GATE_SCREENSHOT, Buffer.from(screenshot.data, "base64"));
+  }
+
+  activeFixture = {backend:BACKEND_PROFILES.official.id,nodes:3,soak:false,run:'report-v3',ui:true,network:true,reports:true,planCards:true};
+  await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/instance/node-0?focus=network`});
+  await waitUntil(cdp, `document.querySelectorAll('.report-main-tabs button').length>0 && document.querySelectorAll('.report-latency-card').length>0`,6000);
+  await waitUntil(cdp, `document.querySelectorAll('.network-instance-plan-grid .network-instance-plan').length === 7`, 3000);
+  failGate(await cdp.value(`(()=>{const cards=[...document.querySelectorAll('.network-instance-plan')]; return cards[0].getBoundingClientRect().top===cards[1].getBoundingClientRect().top && cards[0].getBoundingClientRect().width<innerWidth/2 && cards[3].textContent.includes('继承分组') && cards[6].querySelector('button').disabled && cards[0].querySelector('a').href.includes('suite=plan-0')})()`),'plan cards lost compact layout or plan state');
+  await cdp.value(`document.querySelector('.network-instance-plan button').click()`);
+  await waitUntil(cdp, `document.querySelector('.network-associated-plans [role="status"]')?.textContent.includes('测速-v4')`, 3000);
+  failGate(reportPlanRuns.length===1 && reportPlanRuns[0].suffix==='suites/plan-0/run' && reportPlanRuns[0].body.nodeUuids.join()==='node-0', 'plan run was not scoped to this VPS');
+  if(process.env.BROWSER_GATE_SCREENSHOT){await cdp.value(`document.querySelector('.network-associated-plans').scrollIntoView({block:'start'})`);await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.associated-plans-desktop.png`);}
+  await cdp.call('Emulation.setDeviceMetricsOverride',{width:390,height:900,deviceScaleFactor:1,mobile:true});
+  failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1 && [...document.querySelectorAll('.network-instance-plan')].every(card=>card.getBoundingClientRect().width<=innerWidth && card.getBoundingClientRect().height<=100)`),'plan cards overflow mobile');
+  if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.associated-plans-mobile.png`);
+  await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  activeFixture.planCards=false;
+  activeFixture.reportSuites=[
+    {id:'suite-empty',name:'另一 IP 方案',clients:['node-0'],groups:[],inherit:true,enabled:true,trafficAccepted:true,modules:[reportRoundData['ip-quality'].parameters],catalogVersion:reportCatalogVersion},
+    {id:'suite-fixture',name:'公网出口周检',clients:['node-0'],groups:[],inherit:true,enabled:true,trafficAccepted:true,modules:['ip-quality','media-unlock'].map(module=>reportRoundData[module].parameters),catalogVersion:reportCatalogVersion},
+  ];
+  await cdp.call('Page.reload');
+  await waitUntil(cdp, `document.querySelectorAll('.report-main-tabs button').length===2 && document.querySelector('.report-empty')?.textContent.includes('尚无IP质量检测报告')`, 6000);
+  await cdp.value(`[...document.querySelectorAll('.report-main-tabs button')].find(button=>button.textContent==='公网出口周检').click()`);
+  await waitUntil(cdp, `document.querySelector('.report-diagnostic-family table')!==null`, 3000);
+  failGate(await cdp.value(`document.querySelector('.report-diagnostic-results').textContent.includes('63高风险') &&
+    document.querySelector('table[aria-label="风险评分"]').textContent.includes('DB-IP0低风险') &&
+    document.querySelector('.report-diagnostic-results').textContent.includes('IPv6') &&
+    document.querySelector('.report-diagnostic-results').textContent.includes('没有返回可识别') &&
+    !document.querySelector('.report-history')`), 'IP plan rendered wrong results or generic TCP trends');
+  await cdp.value(`[...document.querySelectorAll('.report-plan-module-tabs button')].find(button=>button.textContent==='流媒体和AI解锁检测').click()`);
+  await waitUntil(cdp, `document.querySelector('.report-diagnostic-results')?.textContent.includes('Netflix解锁USDNS')`, 3000);
+  await cdp.value(`document.querySelector('.report-diagnostic-family summary').click()`);
+  failGate(await cdp.value(`document.querySelector('[aria-label="解锁判定依据"]').textContent.includes('ChatGPTRegionRestrictionCheck未能确认') &&
+    document.querySelector('[aria-label="流媒体和 AI 解锁"]').textContent.includes('ChatGPT解锁US原生')`), 'Unlock evidence did not preserve the conflicting and selected observations');
+  activeFixture.reportSuites=undefined;
+  await cdp.call('Page.reload');
+  await waitUntil(cdp, `document.querySelectorAll('.report-main-tabs button').length>0 && document.querySelectorAll('.report-latency-card').length>0`,6000);
+  failGate(await cdp.value(`document.querySelector('.report-latency-card').querySelectorAll('.report-sample').length===10`),'v3 matrix did not preserve ten attempts');
+  await cdp.value(`Array.from(document.querySelectorAll('.report-pills button')).find(b=>b.textContent==='网站').click()`);
+  await waitUntil(cdp,`document.querySelectorAll('.report-latency-card').length>=30`,2000);
+  await cdp.value(`document.querySelector('.report-sample-failure').click()`);
+  await waitUntil(cdp,`document.querySelector('.network-drawer[open]')?.textContent.includes('HTTP 403')`,2000);
+  await cdp.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await waitUntil(cdp,`document.querySelector('.network-drawer[open]')===null`,2000);
+  await cdp.value(`document.querySelector('.report-more-actions summary').focus(); document.querySelector('.report-more-actions summary').click()`);
+  failGate(await cdp.value(`document.querySelector('.report-more-actions').open`),'report actions menu did not open');
+  await cdp.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  failGate(await cdp.value(`!document.querySelector('.report-more-actions').open`),'report actions menu did not close with Escape');
+  for(const appearance of ['light','dark']){
+    await cdp.value(`localStorage.setItem('appearance',JSON.stringify(${JSON.stringify('crystal-'+appearance)}))`);
+    await cdp.call('Page.reload');await waitUntil(cdp,`document.querySelectorAll('.report-latency-card').length>0`,5000);
+    await cdp.value(`document.querySelector(".report-main-tabs").scrollIntoView({block:"start"})`);
+    if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-international-${appearance}.png`);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent==='大陆路由').click()`);
+    await waitUntil(cdp,`document.querySelector('.report-mtr-table')!==null`,2000);
+    failGate(await cdp.value(`(()=>{const p=document.querySelector('.report-route-controls');return !!p && ['路由方向','路由地区','运营商','探测协议'].every(label=>p.querySelector('[aria-label="'+label+'"]')) && !!p.querySelector('.report-route-target select') && !!document.querySelector('.report-route-observation') && !!document.querySelector('.report-route-table-heading .report-fold')})()`),'route controls or observation grouping missing');
+    await cdp.value(`Array.from(document.querySelectorAll('[aria-label="路由方向"] button')).find(b=>b.textContent.includes('去程')).click()`);
+    failGate(await cdp.value(`document.querySelector('[aria-label="路由方向"] button[aria-pressed="true"]').textContent.includes('去程')`),'forward route selection failed');
+    await cdp.value(`Array.from(document.querySelectorAll('[aria-label="路由方向"] button')).find(b=>b.textContent.includes('回程')).click()`);
+    await waitUntil(cdp,`document.querySelector('.report-mtr-table')!==null`,2000);
+    await cdp.value(`document.querySelector('.report-route-table-heading .report-fold').click()`);
+    failGate(await cdp.value(`document.querySelector('.report-route-table-heading .report-fold').getAttribute('aria-pressed')==='true'`),'AS folding toggle failed');
+    await cdp.value(`document.querySelector('.report-route-table-heading .report-fold').click()`);
+    failGate(await cdp.value(`document.querySelector('.report-mtr-table').textContent.includes('4809')`),'v3 MTR lost ASN evidence');
+    failGate(await cdp.value(`document.querySelector('.report-mtr-table').textContent.includes('中国 · 上海') && document.querySelector('.report-mtr-table').textContent.includes('CN2-BackBone') && document.querySelector('.report-mtr-table').textContent.includes('chinatelecom.com.cn')`),'route table dropped metadata alongside network');
+    await cdp.value(`document.querySelector('.report-metadata-observation > summary').click()`);
+    failGate(await cdp.value(`document.querySelector('.report-metadata-observation[open]').textContent.includes('不参与上方 MTR 统计')`),'independent NextTrace observation missing');
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent==='全球 BGP 路径快照').click()`);
+    await waitUntil(cdp,`document.querySelector('.report-bgp-graph svg')!==null`,2000);
+    await cdp.value(`document.querySelector('.report-bgp-graph svg g[tabindex]')?.focus()`);
+    await cdp.value(`document.querySelector(".report-main-tabs").scrollIntoView({block:"start"})`);
+    if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-routes-${appearance}.png`);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent==='TcpQuality 完整检测').click()`);
+    await waitUntil(cdp,`document.querySelector('.report-full-tcp pre')?.textContent.includes('TcpQuality 测试报告示例')`,2000);
+    failGate(await cdp.value(`!document.querySelector('.report-plan-module-tabs') && document.querySelectorAll('.report-module').length===1 && !document.querySelector('.report-full-tcp details[open]') && getComputedStyle(document.querySelector('.report-main-tabs')).borderBottomStyle!=='solid'`), 'quality tabs, collapsed output or main tab styling incorrect');
+    failGate(await cdp.value(`document.querySelector('.report-full-tcp').textContent.includes('上游报告已补传') && document.querySelector('.report-full-tcp a')?.href==='https://tcpquality.ibsgss.uk/r/fixture' && document.querySelector('.report-full-tcp button')?.textContent.includes('CSV')`), 'full TcpQuality report or recovered URL missing');
+    failGate(await cdp.value(`(()=>{const f=document.querySelector('.report-upstream-preview iframe');return f?.getAttribute('src')==='https://tcpquality.ibsgss.uk/r/fixture' && f.title==='TcpQuality 在线报告' && f.referrerPolicy==='no-referrer' && f.sandbox.contains('allow-scripts') && !f.sandbox.contains('allow-top-navigation')})()`), 'full TcpQuality inline preview missing or unsafe');
+    failGate(await cdp.value(`document.querySelector('.report-full-coverage').textContent.includes('失败 1') && document.querySelector('.report-full-coverage').textContent.includes('IPv6：不可用')`), 'full TcpQuality coverage was misreported');
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent.includes('NodeQuality 完整检测')).click()`);
+    await waitUntil(cdp,`document.querySelector('iframe[title="NodeQuality 在线报告"]')!==null`,2000);
+    failGate(await cdp.value(`(()=>{const f=document.querySelector('iframe[title="NodeQuality 在线报告"]');return f.getAttribute('src')==='https://nodequality.com/r/fixture' && f.referrerPolicy==='no-referrer' && f.sandbox.contains('allow-scripts') && !f.sandbox.contains('allow-top-navigation') && f.closest('.report-full-tcp').textContent.includes('IP 质量')})()`), 'NodeQuality report preview or local data missing');
+    failGate(await cdp.value(`document.querySelectorAll('.report-module').length===1 && !document.querySelector('iframe[title="TcpQuality 在线报告"]')`),'quality report tabs are not exclusive');
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent.includes('大陆 TCP 质量')).click()`);
+    await waitUntil(cdp,`document.querySelectorAll('.report-latency-card').length===9`,2000);
+    await cdp.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1 && document.documentElement.scrollWidth<=innerWidth+1`), 'TcpQuality preview overflows mobile viewport');
+    await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+    if(process.env.BROWSER_GATE_SCREENSHOT){
+      await cdp.value(`document.querySelector('.report-latency-grid').scrollIntoView({block:'start'})`);
+      await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-tcp-${appearance}.png`);
+    }
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent==='大陆单连接测速').click()`);
+    await waitUntil(cdp,`document.querySelectorAll('.report-throughput-card').length===9`,2000);
+    if(process.env.BROWSER_GATE_SCREENSHOT){
+      await cdp.value(`document.querySelector('.report-throughput-grid').scrollIntoView({block:'start'})`);
+      await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-speed-cards-${appearance}.png`);
+    }
+    await cdp.value(`document.querySelector('.report-history summary').click()`);
+    await waitUntil(cdp,`document.querySelector('.report-history-chart circle')!==null`,2000);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-pills button')).find(b=>b.textContent==='完整指标').click()`);
+    await waitUntil(cdp,`document.querySelectorAll('.report-speed-table tbody tr').length===9`,2000);
+    await cdp.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1`),'v3 speed page overflows 390px');
+    failGate(await cdp.value(`document.querySelector('.report-speed-table').getBoundingClientRect().width<=innerWidth`),'mobile speed metrics do not adapt');
+    await cdp.value(`document.querySelector(".report-main-tabs").scrollIntoView({block:"start"})`);
+    if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-speed-mobile-${appearance}.png`);
+    await cdp.value(`document.querySelector('.report-workspace-heading button').click()`);
+    await waitUntil(cdp,`document.querySelector('.report-plan-panel')!==null`,6000);
+    failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1`),'unified network center overflows mobile');
+    await cdp.value(`Array.from(document.querySelectorAll('.report-preset-grid button')).find(b=>b.textContent.includes('TcpQuality 完整检测')).click()`);
+    failGate(await cdp.value(`document.querySelector('.report-plan-panel').textContent.includes('--enable-tcpquality-full') && document.querySelector('.report-plan-panel').textContent.includes('700 MiB')`), 'full TcpQuality setup requirements missing');
+    await cdp.value(`Array.from(document.querySelectorAll('.report-preset-grid button')).find(b=>b.textContent.includes('NodeQuality 完整检测')).click()`);
+    failGate(await cdp.value(`document.querySelector('.report-plan-panel').textContent.includes('1.5 GiB') && document.querySelector('.report-plan-panel').textContent.includes('NodeQuality 第三方') && document.querySelector('.report-plan-panel').textContent.includes('回程路由')`), 'NodeQuality settings or disclosure missing');
+    for (const label of ['IP质量检测','流媒体和AI解锁检测']) {
+      await cdp.value(`[...document.querySelectorAll('.report-preset-grid button')].find(b=>b.textContent.includes(${JSON.stringify(label)})).click()`);
+    }
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-steps button')).find(b=>b.textContent.includes('定时时间')).click()`);
+    failGate(await cdp.value(`['IP质量检测','流媒体和AI解锁检测'].every(label=>[...document.querySelectorAll('.report-plan-module')].some(p=>p.querySelector('h3')?.textContent.includes(label) && p.querySelector('.report-schedule-rules')))`), 'IP and unlock did not receive the full schedule editor');
+    await cdp.value(`document.querySelector('.report-plan-module select').value='daily';document.querySelector('.report-plan-module select').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitUntil(cdp,`document.querySelector('.report-plan-panel input[placeholder="04:00, 21:00"]')!==null`,2000);
+    await cdp.value(`document.querySelector('.report-plan-panel input[placeholder="04:00, 21:00"]').focus();document.querySelector('.report-plan-panel input[placeholder="04:00, 21:00"]').select()`);
+    await cdp.call('Input.insertText',{text:'04:00, 21:00'});
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-module')).find(x=>x.querySelector('h3')?.textContent.includes('TcpQuality 完整检测')).querySelector('.report-schedule-rules > button').click()`);
+    failGate(await cdp.value(`(()=>{const p=Array.from(document.querySelectorAll('.report-plan-module')).find(x=>x.querySelector('h3')?.textContent.includes('TcpQuality 完整检测'));const rules=p.querySelectorAll('.report-schedule-rule');return rules.length===2 && rules[1].querySelector('select').value==='every-days' && !!rules[1].querySelector('input[type=date]') && !!rules[1].querySelector('input[type=time]')})()`), 'N-day schedule rule missing');
+    await cdp.value(`(()=>{const p=Array.from(document.querySelectorAll('.report-plan-module')).find(x=>x.querySelector('h3')?.textContent.includes('TcpQuality 完整检测')); const n=p.querySelectorAll('.report-schedule-rule')[1].querySelector('input[type=number]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(n,'3');n.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-module')).find(x=>x.querySelector('h3')?.textContent.includes('TcpQuality 完整检测')).querySelector('.report-schedule-rules > button').click()`);
+    await cdp.value(`(()=>{const p=Array.from(document.querySelectorAll('.report-plan-module')).find(x=>x.querySelector('h3')?.textContent.includes('TcpQuality 完整检测')); const s=p.querySelectorAll('.report-schedule-rule')[2].querySelector('select'); s.value='weekly';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    await waitUntil(cdp,`document.querySelector('.report-schedule-weekdays')!==null`,2000);
+    failGate(await cdp.value(`document.querySelectorAll('.report-schedule-weekdays input').length===7 && document.documentElement.scrollWidth<=innerWidth+1`),'weekly schedule or mobile layout broken');
+    if(process.env.BROWSER_GATE_SCREENSHOT){ await cdp.value(`document.querySelector('.report-schedule-weekdays').scrollIntoView({block:'center'})`); await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.full-schedule-${appearance}.png`); }
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-steps button')).find(b=>b.textContent.includes('VPS 与覆盖')).click()`);
+    await cdp.value(`document.querySelector('input[aria-label="搜索执行 VPS"]').focus()`);
+    await cdp.call('Input.insertText',{text:'2 scale'});
+    await waitUntil(cdp,`document.querySelectorAll('.report-target-checklist label').length===1 && document.querySelector('.report-target-checklist').textContent.includes('Scale Node 2')`,2000);
+    await cdp.value(`document.querySelector('input[aria-label="搜索执行 VPS"]').focus(); document.querySelector('input[aria-label="搜索执行 VPS"]').select()`);
+    await cdp.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});
+    failGate(await cdp.value(`(() => {
+      const targets=document.querySelector('.report-execution-vps');
+      const groups=document.querySelector('.report-group-options');
+      return parseFloat(getComputedStyle(targets).paddingInlineStart)>=10 &&
+        getComputedStyle(groups).display==='flex' && getComputedStyle(groups).flexWrap==='wrap' &&
+        document.querySelector('.report-coverage-preview')===null;
+    })()`), 'VPS editor padding, group layout or initial preview state is incorrect');
+    await waitUntil(cdp,`Array.from(document.querySelectorAll('.report-plan-footer button')).some(b=>b.textContent.includes('保存报告方案') && !b.disabled)`,3000);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-footer button')).find(b=>b.textContent.includes('保存报告方案')).click()`);
+    await waitUntil(cdp,`document.querySelector('.report-saved-plan-select')!==null`,3000);
+    failGate(await cdp.value(`document.querySelector('.report-saved-plans').compareDocumentPosition(document.querySelector('.report-plan-steps')) & Node.DOCUMENT_POSITION_FOLLOWING`),'saved plans not above editor');
+    await cdp.value(`document.querySelector('.report-saved-plan-select').click()`);
+    failGate(await cdp.value(`document.querySelector('.report-saved-plan-select').getAttribute('aria-pressed')==='true'`),'saved plan card did not select plan');
+    if(process.env.BROWSER_GATE_SCREENSHOT){ await cdp.value(`document.querySelector('.report-saved-plans').scrollIntoView({block:'start'})`); await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.saved-plans-${appearance}.png`); }
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-steps button')).find(b=>b.textContent.includes('VPS 与覆盖')).click()`);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-plan-panel button')).find(b=>b.textContent.includes('预览每台')).click()`);
+    await waitUntil(cdp,`document.querySelector('.report-coverage-preview details')!==null`,2000);
+    if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.report-plan-mobile-${appearance}.png`);
+    failGate(await cdp.value(`['主页延迟检测','主页三网线路','检测方案','探测器与测量点','目标端点'].every(title=>Array.from(document.querySelectorAll('.blackwhite-studio-panel h2')).some(e=>e.textContent===title))`), 'network center panels missing');
+    failGate(await cdp.value(`!document.body.textContent.includes('旧版单次检测与历史') && !document.body.textContent.includes('工具诊断与旧计划') && !document.body.textContent.includes('兼容与迁移')`), 'removed network functionality is still visible');
+    failGate(await cdp.value(`Array.from(document.querySelectorAll('.report-target-checklist input:checked')).length===1`),'instance shortcut lost selected VPS');
+    await cdp.value(`document.querySelector('#network-agents').scrollIntoView({block:'start'})`);
+    await cdp.value(`document.querySelector('input[aria-label="搜索并选择VPS"]').focus()`);
+    await cdp.call('Input.insertText',{text:'2 scale'});
+    await waitUntil(cdp,`document.querySelectorAll('.measurement-node-switcher [role="option"]').length===1 && document.querySelector('.measurement-node-switcher [role="option"]').textContent.includes('Scale Node 2')`,2000);
+    if(process.env.BROWSER_GATE_SCREENSHOT) await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.measurement-search-${appearance}.png`);
+    await cdp.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    for (const label of ['探针名称','大陆城市']) {
+      await cdp.value(`Array.from(document.querySelectorAll('.measurement-points-panel label')).find(l=>l.textContent.startsWith(${JSON.stringify(label)})).querySelector('input').focus()`);
+      await cdp.call('Input.insertText', {text:label==='探针名称'?'上海测试测量点':'上海'});
+    }
+    await cdp.value(`Array.from(document.querySelectorAll('.measurement-points-panel button')).find(b=>b.textContent==='生成大陆探针凭证').click()`);
+    await waitUntil(cdp, `document.querySelector('.network-credential-reveal')?.textContent.includes('--probe-id')`, 2000);
+    failGate(await cdp.value(`document.querySelector('.network-credential-reveal code').textContent.length===64`), 'probe credentials are unavailable');
+    failGate(await cdp.value(`!document.querySelector('.network-credential-reveal pre').textContent.includes('--enable-tcpquality-full')`), 'measurement point command unexpectedly enables the full VPS executor');
+    await cdp.value(`Array.from(document.querySelectorAll('.measurement-points-panel button')).find(b=>b.textContent==='隐藏凭证').click()`);
+    failGate(await cdp.value(`document.querySelector('.network-credential-reveal')===null`), 'credential reveal did not clear');
+    reportSavedSuite = null;
+    await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/instance/node-0?focus=network`});
+    await waitUntil(cdp, `document.querySelectorAll('.report-main-tabs button').length>0`, 4000);
+    await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  }
+  results.push({reportV3:'ten original samples, 403 detail, routes/ASN and BGP evidence, nine speed rows, dark/light 390px, daily multiple times and coverage preview, keyboard Escape'});
+  }
+
+  // Rich route metadata remains readable on all appearances and narrow screens.
+  activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, ui: true, network: true, reports: true, run: 'measurement-maintenance' };
+  pointFixture.registeredNodes=['node-0'];
+  await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/`});
+  await waitUntil(cdp,`document.querySelector('.app-shell')!==null`,6000);
+  for (const appearance of ['light','dark']) {
+    await cdp.value(`localStorage.setItem('appearance',JSON.stringify(${JSON.stringify('crystal-'+appearance)}))`);
+    await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/?view=theme-manage&section=network&panel=agents&nodes=node-0`});
+    await waitUntil(cdp,`document.querySelector('.measurement-install pre')?.textContent.includes('--upgrade') && document.querySelector('.measurement-install pre')?.textContent.includes('--enable-tcpquality-full')`,6000);
+    const mutations=requestCounts.get('measurement-maintenance')?.['credential-mutation']||0;
+    await cdp.value(`Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{window.__copiedUpgrade=text}}});Array.from(document.querySelectorAll('.measurement-install button')).find(b=>b.textContent==='复制升级命令').click()`);
+    await waitUntil(cdp,`window.__copiedUpgrade?.includes('--upgrade') && window.__copiedUpgrade?.includes('--enable-tcpquality-full')`,2000);
+    failGate((requestCounts.get('measurement-maintenance')?.['credential-mutation']||0)===mutations,'copy upgrade rotated a credential');
+    failGate(await cdp.value(`!document.querySelector('.measurement-auto-update input').checked`),'automatic updates enabled without consent');
+    await waitUntil(cdp,`document.querySelector('.measurement-credentials button')?.disabled===false`,2000);
+    await cdp.value(`document.querySelector('.measurement-credentials summary').click();Array.from(document.querySelectorAll('.measurement-credentials button')).find(b=>b.textContent==='重置 VPS 凭证').click()`);
+    await waitUntil(cdp,`document.querySelector('dialog[open]')?.textContent.includes('401')`,2000);
+    await cdp.value(`Array.from(document.querySelectorAll('dialog[open] button')).find(b=>b.textContent==='取消').click()`);
+    failGate((requestCounts.get('measurement-maintenance')?.['credential-mutation']||0)===mutations,'cancel reset rotated a credential');
+    for(const width of [1440,390]) {
+      await cdp.call('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:width===390});
+      failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1`),`measurement panel overflows ${appearance}/${width}`);
+      failGate(await cdp.value(`Array.from(document.querySelectorAll('.measurement-layout h3')).every(e=>getComputedStyle(e).fontSize==='15px')`),'measurement heading font sizes differ');
+      await cdp.value(`document.querySelector('#network-agents').scrollIntoView({block:'start'})`);
+      if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.measurement-${appearance}-${width}.png`);
+    }
+    await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  }
+  await cdp.value(`document.querySelector('.measurement-auto-update input').click()`);
+  await waitUntil(cdp,`document.querySelector('.measurement-auto-update input').checked`,2000);
+  failGate(pointFixture.updatePolicies['node:node-0']?.enabled===true,'automatic update preference did not persist');
+  await cdp.value(`document.querySelector('.measurement-auto-update input').click()`);
+  await waitUntil(cdp,`!document.querySelector('.measurement-auto-update input').checked`,2000);
+  await waitUntil(cdp,`document.querySelector('.measurement-credentials button')?.disabled===false`,2000);
+  const mutationsBeforeReset=requestCounts.get('measurement-maintenance')?.['credential-mutation']||0;
+  await cdp.value(`Array.from(document.querySelectorAll('.measurement-credentials button')).find(b=>b.textContent==='重置 VPS 凭证').click()`);
+  await waitUntil(cdp,`document.querySelector('dialog[open]')?.textContent.includes('401')`,2000);
+  await cdp.value(`Array.from(document.querySelectorAll('dialog[open] button')).find(b=>b.textContent==='确认重置').click()`);
+  await waitUntil(cdp,`document.querySelector('.network-credential-reveal code')?.textContent.length===64`,2000);
+  failGate((requestCounts.get('measurement-maintenance')?.['credential-mutation']||0)===mutationsBeforeReset+1,'confirmed reset did not issue exactly one credential');
+  failGate(await cdp.value(`(()=>{const command=document.querySelector('.network-credential-reveal pre').textContent;return command.includes('agent.py configure') && command.includes('--upgrade --enable-tcpquality-full') && command.includes(' && ')})()`),'reset must configure the new credential before enabling the full executor');
+  await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/?view=theme-manage&section=network&panel=agents&nodes=node-1`});
+  await waitUntil(cdp,`Array.from(document.querySelectorAll('.measurement-agent button')).some(b=>b.textContent==='生成 VPS 接入凭证')`,6000);
+  failGate(await cdp.value(`document.querySelector('.measurement-install pre').textContent.includes('--enable-tcpquality-full') && !document.querySelector('.measurement-install pre').textContent.includes('--upgrade')`),'new VPS install command must enable the shared full executor');
+  await cdp.value(`(()=>{const select=document.querySelector('.measurement-install select');select.value='lite';select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await waitUntil(cdp,`document.querySelector('.measurement-install pre').textContent.includes("--profile 'lite'")`,2000);
+  await cdp.value(`Array.from(document.querySelectorAll('.measurement-agent button')).find(b=>b.textContent==='生成 VPS 接入凭证').click()`);
+  await waitUntil(cdp,`document.querySelector('.network-credential-reveal pre')?.textContent.includes('--enable-tcpquality-full')`,2000);
+  failGate(await cdp.value(`!document.querySelector('.network-credential-reveal pre').textContent.includes('agent.py configure') && document.querySelector('.network-credential-reveal pre').textContent.includes("--profile 'lite'")`),'new VPS credential command must remain a fresh installation with the selected profile');
+  results.push({measurementMaintenance:'visible upgrade command, credential mutation isolation, reset cancellation/confirmation, default-off opt-in policy and uniform typography; three base appearances at 1440/390px'});
+  activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, ui: true, network: true, reports: true, run: 'route-metadata' };
+  for (const appearance of ['light','dark']) {
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify(${JSON.stringify('crystal-'+appearance)}))`);
+    await cdp.call('Page.navigate', { url: `http://127.0.0.1:${address.port}/instance/node-0?focus=network` });
+    await waitUntil(cdp, `document.querySelectorAll('.report-main-tabs button').length>0`, 6000);
+    await cdp.value(`Array.from(document.querySelectorAll('.report-main-tabs button')).find(b=>b.textContent==='大陆路由').click()`);
+    await waitUntil(cdp, `document.querySelector('.report-metadata-observation')!==null`, 3000);
+    await cdp.value(`document.querySelector('.report-metadata-observation > summary').click()`);
+    for (const width of [1440,390]) {
+      await cdp.call('Emulation.setDeviceMetricsOverride', {width,height:1000,deviceScaleFactor:1,mobile:width===390});
+      failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1`), `route metadata overflows ${appearance}/${width}`);
+      failGate(await cdp.value(`document.querySelector('.report-mtr-table').textContent.includes('中国 · 上海') && document.querySelector('.report-mtr-table').textContent.includes('中国电信')`), `route location lost in ${appearance}`);
+      failGate(await cdp.value(`(()=>{const box=document.querySelector('.report-route-controls'), label=box.querySelector('.report-route-filter > span');const cv=document.createElement('canvas');cv.width=cv.height=1;const c=cv.getContext('2d');const rgb=v=>{c.clearRect(0,0,1,1);c.fillStyle=v;c.fillRect(0,0,1,1);return [...c.getImageData(0,0,1,1).data].slice(0,3).map(x=>{x/=255;return x<=.04045?x/12.92:((x+.055)/1.055)**2.4})};const lum=a=>.2126*a[0]+.7152*a[1]+.0722*a[2];const a=lum(rgb(getComputedStyle(box).backgroundColor)),b=lum(rgb(getComputedStyle(label).color));return (Math.max(a,b)+.05)/(Math.min(a,b)+.05)>=3})()`),`route filter labels have insufficient contrast in ${appearance}/${width}`);
+      if(process.env.BROWSER_GATE_SCREENSHOT){await cdp.value(`document.querySelector('.report-route-controls').scrollIntoView({block:'start'})`);await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.route-controls-${appearance}-${width}.png`);}
+      await cdp.value(`document.querySelector('.report-metadata-observation').scrollIntoView({block:'start'})`);
+      if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.route-metadata-${appearance}-${width}.png`);
+    }
+  }
+  await cdp.call('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  results.push({routeMetadata:'network/location/WHOIS/domain and independent NextTrace diagnostics, three base appearances at 1440/390px'});
+
+  // All base appearances consume summaries produced by the actual built-in preset.
+  activeFixture = { backend: BACKEND_PROFILES.official.id, nodes: 3, ui: true, network: true, reports: true, run: 'network-center' };
+  await cdp.call('Page.navigate', { url: `http://127.0.0.1:${address.port}/` });
+  await waitUntil(cdp, `location.origin === 'http://127.0.0.1:${address.port}'`, 6000);
+  await cdp.call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await cdp.call('Page.reload');
+  await waitUntil(cdp, `document.querySelector('.home-command-action[href*="panel=plans"]')!==null`,6000);
+  await cdp.value(`document.querySelector('.home-command-action[href*="panel=plans"]').click()`);
+  await waitUntil(cdp, `document.querySelector('.home-routes-publish-nodes input')!==null`, 6000);
+  await cdp.value(`document.querySelector('.home-routes-publish-nodes input').click();Array.from(document.querySelectorAll('.home-routes-publish button')).find(b=>b.textContent==='保存显示与发布范围').click()`);
+  await waitUntil(cdp, `document.querySelector('.home-routes-publish [role="status"]')?.textContent.includes('已保存')`, 2000);
+  failGate(homeRouteNodes.length===1 && homeRouteNodes[0]==='node-0','publication selection did not reach plugin');
+  await waitUntil(cdp, `document.querySelector('.home-speeds-publish-nodes input')!==null`, 6000);
+  await cdp.value(`document.querySelector('.home-speeds-publish-nodes input').click();Array.from(document.querySelectorAll('.home-speeds-publish button')).find(b=>b.textContent==='保存显示与发布范围').click()`);
+  await waitUntil(cdp, `document.querySelector('.home-speeds-publish [role="status"]')?.textContent.includes('已保存')`,2000);
+  failGate(homeSpeedNodes.length===1 && homeSpeedNodes[0]==='node-0','speed publication scope did not reach plugin');
+  await cdp.value(`document.querySelector('select[aria-label="线路展示方式"]').value='full';document.querySelector('select[aria-label="线路展示方式"]').dispatchEvent(new Event('change',{bubbles:true}));document.querySelector('input[aria-label="显示线路确认说明"]').click();Array.from(document.querySelectorAll('.home-routes-publish button')).find(b=>b.textContent==='保存显示与发布范围').click()`);
+  await waitUntil(cdp, `document.querySelector('.home-routes-publish [role="status"]')?.textContent.includes('已保存') && !Array.from(document.querySelectorAll('.home-routes-publish button')).find(b=>b.textContent==='保存显示与发布范围')?.disabled`,2000);
+  await cdp.value(`document.querySelector('input[aria-label="显示测速计量说明"]').click();Array.from(document.querySelectorAll('.home-speeds-publish button')).find(b=>b.textContent==='保存显示与发布范围').click()`);
+  await waitUntil(cdp, `document.querySelector('.home-speeds-publish [role="status"]')?.textContent.includes('已保存')`,2000);
+  failGate(homeRouteLabelMode==='full' && homeRouteShowDetails && homeSpeedShowDetails,'presentation settings were not saved to the plugin');
+  await cdp.call('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await cdp.value(`document.querySelector('#network-routes').scrollIntoView({block:'start'})`);
+  if(process.env.BROWSER_GATE_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_GATE_SCREENSHOT}.network-center.png`);
+  activeFixture = {...activeFixture, ui:false};
+  await cdp.call('Page.navigate', {url:`http://127.0.0.1:${address.port}/`});
+  await waitUntil(cdp, `document.querySelector('.crystal-card[data-node="node-0"] .crystal-route-value:enabled')!==null`, 6000);
+  failGate(await cdp.value(`[...document.querySelectorAll('.crystal-route-value:enabled, .crystal-speed-value:enabled')].every(el=>el.closest('.crystal-card').dataset.node==='node-0')`), 'published evidence escaped the selected VPS scope');
+  homeRouteDisplay=false;
+  await cdp.call('Page.reload');
+  await waitUntil(cdp, `document.querySelector('.crystal-speed-value:enabled')!==null && document.querySelector('.crystal-route-value')===null`, 6000);
+  homeRouteDisplay=true;
+  homeSpeedDisplay=false;
+  await cdp.call('Page.reload');
+  await waitUntil(cdp, `document.querySelector('.crystal-route-value:enabled')!==null && document.querySelector('.crystal-speed-value')===null`, 6000);
+  homeSpeedDisplay=true;
+  homeRouteLabelMode='preferred';homeRouteShowDetails=false;homeSpeedShowDetails=false;
+  failGate((requestCounts.get('network-center')?.['removed-network-api'] || 0)===0,'removed network APIs still requested');
+  results.push({networkCenter:'publication scope, display switches, shared navigation and no obsolete APIs'});
+
+  for (const backend of Object.values(BACKEND_PROFILES)) {
+    await clearFixturePage(cdp);
+    console.log(`Checking comprehensive report: ${backend.label}`);
+    activeFixture = { backend: backend.id, nodes: 3, ui: true, network: true, reports: true, comprehensive: true, run: `comprehensive-${backend.id}` };
+    requestCounts.set(activeFixture.run, {}); requestPayloads.set(activeFixture.run, []); savedUiSettings = null;
+    await cdp.call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+    await cdp.call('Page.navigate', { url: `http://127.0.0.1:${address.port}/instance/node-0` });
+    await waitUntil(cdp, `document.querySelector('.instance-report-entry')!==null`, 6000);
+    await cdp.value(`document.querySelector('.instance-report-entry').click()`);
+    await waitUntil(cdp, `document.querySelector('.instance-report-generate')!==null`, 6000);
+    if (process.env.BROWSER_REPORT_SCREENSHOT && backend.id === BACKEND_PROFILES.official.id) await captureScreenshot(cdp, `${process.env.BROWSER_REPORT_SCREENSHOT}-dates.png`, { waitForImages: false });
+    failGate(await cdp.value(`location.pathname.endsWith('/report')`), 'report entry did not navigate to the lazy route');
+    await cdp.value(`Array.from(document.querySelectorAll('.instance-report-presets button')).find(b=>b.textContent.includes('全部历史')).click()`);
+    failGate(await cdp.value(`document.querySelector('.instance-report-presets button[aria-pressed="true"]')?.textContent.includes('全部历史') && document.querySelector('.instance-report-options input[type="checkbox"]').disabled`), 'all-history preset or comparison behavior missing');
+    console.log(`  ${backend.label}: generating all-history report`);
+    await cdp.value(`document.querySelector('.instance-report-generate').click()`);
+    await waitUntil(cdp, `(document.querySelector('.instance-report-frame')!==null && document.querySelector('.instance-report-frame').style.display!=='none' && document.querySelector('.instance-report-progress')===null) || document.querySelector('.instance-report-error')!==null`, 15000);
+    console.log(`  ${backend.label}: all-history generated`);
+    failGate(await cdp.value(`!document.querySelector('.instance-report-error') && JSON.parse(new DOMParser().parseFromString(document.querySelector('.instance-report-frame').srcdoc,'text/html').getElementById('report-data').textContent).range.allHistory===true`), 'all-history generation failed');
+    failGate(rpcRequests(activeFixture.run, backend.id === BACKEND_PROFILES.official.id ? 'public:queryMetrics' : 'common:getRecords').some(r=>r.params.start==='1970-01-01T00:00:00.000Z'), 'all-history query did not cover the epoch');
+    await cdp.value(`document.querySelector('.instance-report-page-actions button').click()`);
+    await cdp.value(`document.querySelector('.instance-report-presets button:nth-child(3)').click()`);
+    await cdp.value(`document.querySelector('.instance-report-generate').click()`);
+    await waitUntil(cdp, `(document.querySelector('.instance-report-frame')!==null && document.querySelector('.instance-report-frame').style.display!=='none' && document.querySelector('.instance-report-progress')===null) || document.querySelector('.instance-report-error')!==null`, 15000);
+    failGate(await cdp.value(`!document.querySelector('.instance-report-error')`), 'report generation failed: '+await cdp.value(`document.querySelector('.instance-report-error')?.textContent`));
+    failGate(await cdp.value(`(()=>{const trigger=document.querySelector('.floating-controls-trigger').getBoundingClientRect();return Array.from(document.querySelectorAll('.instance-report-page-actions button')).every(button=>{const r=button.getBoundingClientRect();return r.right<=trigger.left||r.top>=trigger.bottom||r.bottom<=trigger.top})})()`), 'report actions overlap the floating controls');
+    console.log(`  ${backend.label}: reading 30-day report`);
+    // Transfer the archive in bounded CDP messages. Node's WebSocket can stall
+    // on multi-megabyte frames even though the browser has generated the file.
+    const sourceLength = await cdp.value(`document.querySelector('.instance-report-frame').srcdoc.length`);
+    let html = '';
+    for (let offset = 0; offset < sourceLength; offset += 131072)
+      html += await cdp.value(`document.querySelector('.instance-report-frame').srcdoc.slice(${offset},${offset + 131072})`);
+    const archive = html.match(/<script id="report-data" type="application\/json">([\s\S]*?)<\/script>/);
+    failGate(Boolean(archive), 'report archive missing');
+    const model = JSON.parse(archive[1]);
+    await checkReportExports({ cdp, model, profile, backend: backend.id, waitUntil, failGate });
+    if (process.env.BROWSER_REPORT_SCREENSHOT && backend.id === BACKEND_PROFILES.official.id) await captureScreenshot(cdp, `${process.env.BROWSER_REPORT_SCREENSHOT}-online.png`, { waitForImages: false });
+    failGate(model.metrics.some(m => m.key === 'cpu') && model.network.length > 0, 'report omitted resource or network evidence: '+JSON.stringify(model.sources));
+    failGate(model.networkTrends.some(t=>t.module==='routes' && t.unit==='线路' && t.points.length>=2) && model.networkTrends.some(t=>t.module==='china-speed' && t.unit==='Mbps' && t.points.length>=2), 'report omitted route or speed history trends');
+    if (backend.id === BACKEND_PROFILES.official.id) failGate(model.metrics.filter(m=>m.key.startsWith('gpu_memory[')).length===2, 'report merged separate GPU devices');
+    failGate(!html.includes('203.0.113.19') && !html.includes('8.8.8.8'), 'redacted report leaked an address');
+    const rpcMethod = backend.id === BACKEND_PROFILES.official.id ? 'public:queryMetrics' : 'common:getRecords';
+    const windowQueries = rpcRequests(activeFixture.run, rpcMethod).filter(r => Date.parse(r.params.start) >= model.range.start && Date.parse(r.params.end) <= model.range.end && (rpcMethod !== 'common:getRecords' || r.params.type === 'load')).map(r=>r.params);
+    failGate(windowQueries.some(r => r.start === new Date(model.range.start).toISOString()) && windowQueries.some(r => r.end === new Date(model.range.end).toISOString()), 'report did not cover its exact frozen window');
+    // The exported model, not a screenshot or current visible chapter, is the archive.
+    const offlinePath = join(profile, `report-${backend.id}.html`); writeFileSync(offlinePath, html);
+    await clearFixturePage(cdp);
+    await cdp.call('Network.enable');
+    await cdp.call('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 });
+    await cdp.call('Page.navigate', { url: new URL(`file://${offlinePath}`).href });
+    await waitUntil(cdp, `document.querySelector('#overview [data-chart] svg')!==null`, 6000);
+    await waitUntil(cdp, `document.querySelector('#overview [data-chart^="ping:"] path')?.getAttribute('d').includes('L')`, 2000);
+    await cdp.value(`document.querySelector('[data-chapter="resources"]').click()`);
+    await waitUntil(cdp, `document.querySelector('#resources [data-chart="cpu"] path')!==null`, 2000);
+    failGate(await cdp.value(`Math.min(...Array.from(document.querySelector('#resources [data-chart="cpu"] path').getAttribute('d').matchAll(/[ML][^, ]+,(-?[\\d.]+)/g),m=>Number(m[1])))<50`), 'display reduction lost the original CPU spike');
+    if (backend.id === BACKEND_PROFILES.official.id) failGate(await cdp.value(`document.querySelector('#resources [data-chart="cpu"] svg circle')!==null`), 'isolated valid CPU sample disappeared across gaps');
+    if (backend.id === BACKEND_PROFILES.official.id) failGate(await cdp.value(`/^M[^ML]+L/.test(document.querySelector('#resources [data-chart="cpu"] path').getAttribute('d'))`), 'mixed retention cadences fragmented an otherwise continuous historical series');
+    failGate(await cdp.value(`document.querySelectorAll('.chapter').length===6 && document.querySelector('#sources #report-original-results')!==null && document.querySelectorAll('#network .full-result-gallery').length===0`), 'report must organize six chapters with a separate complete-image appendix');
+    failGate(await cdp.value(`document.querySelector('.appendix-entry [data-jump=sources]')!==null && document.querySelectorAll('#overview .report-metric').length===3`), 'summary must expose screenshots and three focused indicators');
+    await cdp.value(`document.querySelector('[data-chapter=events]').click();document.querySelector('[data-evidence]')?.click()`);
+    failGate(await cdp.value(`(()=>{const button=document.querySelector('#events [data-evidence]');return !button || (document.activeElement.id===button.dataset.evidence && !document.activeElement.closest('.chapter').hidden && [...document.querySelectorAll('details')].filter(d=>d.contains(document.activeElement)).every(d=>d.open))})()`), 'action did not reveal its associated evidence');
+    console.log(`  ${backend.label}: drawing offline network trends`);
+    await cdp.value(`document.querySelector('[data-chapter="network"]').click()`);
+    failGate(await cdp.value(`(()=>{const picker=document.querySelector('[data-ping-picker]');const original=picker.value;picker.value=picker.options[picker.options.length-1].value;picker.dispatchEvent(new Event('change'));const selected=picker.value;const ok=document.querySelector('[data-report-ping=latency] [data-chart]').dataset.chart==='ping:'+selected && document.querySelector('[data-report-ping=loss] [data-chart]').dataset.chart==='ping-loss:'+selected;picker.value=original;picker.dispatchEvent(new Event('change'));return ok})()`), 'paired latency and failure charts must switch together');
+    await cdp.value(`document.querySelector('.trend-explorer').closest('details').open=true`);
+    await waitUntil(cdp, `document.querySelector('#network [data-chart^="network-category:"] svg circle')!==null && document.querySelector('#network [data-chart^="network:"] svg')!==null`, 4000);
+    if (process.env.BROWSER_REPORT_SCREENSHOT && backend.id === BACKEND_PROFILES.official.id) {
+      await cdp.value(`document.querySelector('.network-trend-group').scrollIntoView({block:'start'})`);
+      await captureScreenshot(cdp, `${process.env.BROWSER_REPORT_SCREENSHOT}-network.png`, { waitForImages: false });
+    }
+    await cdp.value(`document.querySelector('[data-chapter="overview"]').click()`);
+    failGate(await cdp.value(`JSON.parse(document.getElementById('report-data').textContent).reportId===${JSON.stringify(model.reportId)}`), 'offline report identity changed');
+    for (const chapter of ['resources','network','traffic','events','sources','overview']) {
+      await cdp.value(`document.querySelector('[data-chapter="${chapter}"]').click()`);
+      await waitUntil(cdp, `document.getElementById('${chapter}').hidden===false`, 1500);
+      failGate(await cdp.value(`document.querySelectorAll('.chapter:not([hidden])').length===1`), 'offline chapter navigation broken');
+      if (chapter === 'sources' && process.env.BROWSER_REPORT_SCREENSHOT && backend.id === BACKEND_PROFILES.official.id) { await cdp.value('document.querySelector("#report-original-results").scrollIntoView({block:"start"})'); await captureScreenshot(cdp, `${process.env.BROWSER_REPORT_SCREENSHOT}-gallery.png`, { waitForImages: false }); }
+    }
+    for (const width of [1024, 390, 320]) {
+      await cdp.call('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: width < 500 });
+      await waitUntil(cdp, `Array.from(document.querySelectorAll('#overview .chart')).every(c=>!c.querySelector('svg')||Math.abs(c.querySelector('svg').viewBox.baseVal.width-c.clientWidth)<1)`, 2000);
+      failGate(await cdp.value(`document.documentElement.scrollWidth<=innerWidth+1`), `offline report overflows ${width}px`);
+      const unreadable = await cdp.value(`Array.from(document.querySelectorAll('#overview svg text')).some(t=>{const r=t.getBoundingClientRect();return r.height<10})`);
+      failGate(!unreadable, 'report chart labels became unreadable on mobile');
+    }
+    await cdp.call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+    for (const appearance of ['light','dark']) {
+      await cdp.value(`document.documentElement.dataset.theme='${appearance}'`);
+      if (process.env.BROWSER_GATE_SCREENSHOT) await captureScreenshot(cdp, `${process.env.BROWSER_GATE_SCREENSHOT}.comprehensive-${backend.id}-${appearance}.png`, { waitForImages: false });
+      if (process.env.BROWSER_REPORT_SCREENSHOT && backend.id === BACKEND_PROFILES.official.id) { await cdp.value('window.scrollTo(0,0)');await captureScreenshot(cdp, `${process.env.BROWSER_REPORT_SCREENSHOT}-${appearance}.png`, { waitForImages: false }); }
+    }
+    await cdp.call('Emulation.setEmulatedMedia', { media: 'print' });
+    failGate(await cdp.value(`Array.from(document.querySelectorAll('.chapter')).every(s=>getComputedStyle(s).display!=='none')`), 'print omitted a hidden chapter');
+    const printed = await cdp.call('Page.printToPDF', { printBackground: true, preferCSSPageSize: true, generateTaggedPDF: false, generateDocumentOutline: false });
+    failGate(printed.data.length > 10000, 'report print PDF is empty');
+    if (process.env.BROWSER_REPORT_PDF_BASE) writeFileSync(`${process.env.BROWSER_REPORT_PDF_BASE}-${backend.id}.pdf`,Buffer.from(printed.data,'base64'));
+    await cdp.call('Emulation.setEmulatedMedia', { media: '' });
+    await cdp.call('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    results.push({ comprehensiveReport: backend.label, verified: 'detail entry, 30-day exact query, worker statistics, all network evidence, redaction, same archived ID, offline charts/navigation, 1024/390/320px, both appearances, PDF all chapters' });
+  }
+
+  for (const backend of Object.values(BACKEND_PROFILES)) {
+    for (const [mode,empty] of [['normal',false],['html',false],['csp',true]]) {
+      await clearFixturePage(cdp);
+      activeFixture={backend:backend.id,nodes:1,ui:true,comprehensive:true,reportOffline:true,reportEmpty:empty,reportWorkerFailure:mode,run:`offline-report-${backend.id}-${mode}`};
+      requestCounts.set(activeFixture.run,{});requestPayloads.set(activeFixture.run,[]);
+      await cdp.call('Page.navigate',{url:`http://127.0.0.1:${address.port}/instance/node-0/report`});
+      await waitUntil(cdp,`document.querySelector('.instance-report-offline-note')!==null`,6000);
+      await cdp.value(`document.querySelector('.instance-report-generate').click()`);
+      await waitUntil(cdp,`document.querySelector('.instance-report-progress')===null && (document.querySelector('.instance-report-frame')!==null || document.querySelector('.instance-report-error')!==null)`,15000);
+      failGate(await cdp.value(`!document.querySelector('.instance-report-error') && document.querySelector('.instance-report-frame')!==null`),`offline report failed with ${mode} worker / ${backend.label}`);
+      const offline=await cdp.value(`(()=>{const d=new DOMParser().parseFromString(document.querySelector('.instance-report-frame').srcdoc,'text/html');const model=JSON.parse(d.getElementById('report-data').textContent);return {snapshot:model.node.snapshot,metrics:model.metrics,notice:d.querySelector('.report-offline-notice')?.textContent,empty:d.querySelector('.executive-intro h2')?.textContent}})()`);
+      failGate(offline.snapshot.online===false && offline.notice?.includes('最后上报') && offline.notice?.includes('不要求节点在线'),'offline report omitted state or cached provenance');
+      if(empty)failGate(!offline.metrics.some(metric=>metric.points.some(p=>p.v!=null)) && offline.empty.includes('无历史数据'),'empty offline report invented history');
+      else failGate(offline.metrics.some(metric=>metric.key==='cpu' && metric.points.length>1),'offline status prevented historical metrics from loading');
+      if(mode==='html')failGate((requestCounts.get(activeFixture.run)?.['report-worker-html']||0)===1,'worker loading failure fixture was not exercised');
+      if(mode==='html' && backend.id===BACKEND_PROFILES.official.id && process.env.BROWSER_REPORT_SCREENSHOT)await captureScreenshot(cdp,`${process.env.BROWSER_REPORT_SCREENSHOT}-offline.png`,{waitForImages:false});
+      results.push({offlineReport:backend.label,worker:mode,history:empty?'absent, explicitly retained as unknown':'retained',verified:'offline node, cached snapshot, historical report and worker compatibility'});
+    }
+  }
+
+  if (process.env.BROWSER_GATE_SCREENSHOT) {
+    activeFixture = {
+      backend: BACKEND_PROFILES.official.id,
+      nodes: 8,
+      soak: false,
+      run: "docs-screenshots",
+      ui: true,
+      docs: true,
+    };
+    activeFixture.network = true;
+    savedUiSettings = null;
+    const screenshotBase = process.env.BROWSER_GATE_SCREENSHOT.replace(/\.png$/, "");
+
+    await cdp.call("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 1000,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/` });
+    await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 8`, 6_000);
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify('crystal-light'))`);
+    await cdp.call("Page.reload");
+    await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 8 && document.title === 'Blackwhite 演示站'`, 6_000);
+    await captureScreenshot(cdp, `${screenshotBase}-overview-light.png`);
+
+    await cdp.value(`document.querySelector('[data-home-overview-trigger="status"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.home-overview-panel.show h3').textContent.includes('在线状态') && document.querySelectorAll('.home-overview-row').length === 8`, 6_000);
+    failGate(await cdp.value(`document.querySelector('.home-overview-row:first-child').dataset.online === 'false' && document.querySelector('.home-overview-row:first-child').textContent.includes('离线于') && document.querySelector('.home-overview-row:first-child').textContent.includes('小时')`), 'online summary did not prioritize and describe the offline VPS');
+    await captureScreenshot(cdp, `${screenshotBase}-online-summary.png`, { waitForImages: false });
+    await cdp.value(`document.querySelector('[data-home-overview-trigger="bandwidth"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.home-overview-panel.show h3').textContent.includes('实时带宽') && document.querySelectorAll('.home-overview-row').length === 8`, 6_000);
+    await cdp.value(`document.querySelector('[data-home-overview-trigger="traffic"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.home-overview-panel.show h3').textContent.includes('流量排行') && document.querySelectorAll('.home-overview-tabs [role="tab"]').length === 3`, 6_000);
+    await waitUntil(cdp, `!Array.from(document.querySelectorAll('.home-overview-empty')).some(item => item.textContent.includes('历史读取失败')) && document.querySelector('.home-overview-row-value strong')?.textContent !== '—'`, 6_000);
+    failGate(
+      (() => {
+        const trafficQueries = rpcRequests("docs-screenshots", "public:queryMetrics")
+          .map(({ params }) => params)
+          .filter((params) => Array.isArray(params.metric_keys)
+            && params.metric_keys.length === 2
+            && params.metric_keys.includes("net.total.up")
+            && params.metric_keys.includes("net.total.down")
+            && params.max_points === 500);
+        const windows = trafficQueries.map((params) => Date.parse(params.end) - Date.parse(params.start));
+        return windows.some((duration) => duration <= 24 * 60 * 60 * 1_000)
+          && windows.some((duration) => duration <= 30 * 24 * 60 * 60 * 1_000);
+      })(),
+      "homepage traffic ranking did not use bounded, dense today and month counter queries",
+    );
+    await cdp.value(`Array.from(document.querySelectorAll('.home-overview-tabs [role="tab"]')).find(button => button.textContent.includes('本月流量')).click()`);
+    failGate(await cdp.value(`document.querySelector('.home-overview-tabs [role="tab"][aria-selected="true"]').textContent.includes('本月流量')`), 'traffic overview month tab did not activate');
+    await cdp.value(`document.querySelector('[data-home-overview-trigger="expiry"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.home-overview-panel.show h3').textContent.includes('7 天到期')`, 6_000);
+    await cdp.value(`document.querySelector('.home-overview-close').click()`);
+    await waitUntil(cdp, `document.querySelector('.home-overview-panel.show') === null`, 2_000);
+
+    await cdp.value(`document.querySelector('button[title="打开资产统计"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.cost-summary-panel.show') !== null`, 6_000);
+    await captureScreenshot(cdp, `${screenshotBase}-asset-summary.png`, { waitForImages: false });
+    await cdp.value(`document.querySelector('button[aria-label="关闭服务器花费"]').click()`);
+    await waitUntil(cdp, `document.querySelector('.cost-summary-panel.show') === null`, 2_000);
+
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify('crystal-dark'))`);
+    await cdp.call("Page.reload");
+    await waitUntil(cdp, `document.documentElement.dataset.appearance === 'dark' && document.querySelectorAll('.home-node-card-slot').length === 8`, 6_000);
+    await captureScreenshot(cdp, `${screenshotBase}-overview-dark.png`);
+
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify('crystal-light'))`);
+    await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/instance/node-1` });
+    await waitUntil(cdp, `Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === 'Ping')`, 6_000);
+    await cdp.value(`Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Ping').click()`);
+    await waitUntil(cdp, `document.querySelector('.instance-ping-task') !== null`, 6_000);
+    await captureScreenshot(cdp, `${screenshotBase}-instance-ping.png`);
+
+    await cdp.call("Page.navigate", {
+      url: `http://127.0.0.1:${address.port}/compare?nodes=node-0,node-1,node-2&metric=ping_latency&hours=24`,
+    });
+    await waitUntil(cdp, `document.querySelector('.compare-page') !== null && document.querySelectorAll('.compare-selected-pill').length === 3 && document.querySelector('.compare-chart-wrap canvas') !== null`, 8_000);
+    await captureScreenshot(cdp, `${screenshotBase}-compare.png`);
+    await cdp.value(`Array.from(document.querySelectorAll('.compare-task-presets button')).find(button => button.textContent.includes('资源压力')).click()`);
+    await waitUntil(cdp, `document.querySelector('.compare-matrix') !== null && new URLSearchParams(location.search).get('metrics') === 'cpu,ram,disk'`, 8_000);
+    failGate(await cdp.value(`document.querySelectorAll('.compare-selected-pill').length === 3 && new URLSearchParams(location.search).get('hours') === '24'`), 'resource preset did not preserve selected VPS and apply its 24-hour range');
+    await cdp.value(`Array.from(document.querySelectorAll('.compare-task-presets button')).find(button => button.textContent.includes('线路稳定性')).click()`);
+    await waitUntil(cdp, `document.querySelector('.compare-matrix') !== null && new URLSearchParams(location.search).get('metrics') === 'ping_latency,ping_loss'`, 8_000);
+    await cdp.value(`Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async value => { window.__copiedAnalysisUrl = value; } } }); Array.from(document.querySelectorAll('.compare-stage-actions button')).find(button => button.textContent.includes('复制分析链接')).click()`);
+    await waitUntil(cdp, `document.querySelector('.compare-export-status')?.textContent.includes('分析链接已复制')`, 4_000);
+    failGate(await cdp.value(`window.__copiedAnalysisUrl.includes('metrics=ping_latency%2Cping_loss') && window.__copiedAnalysisUrl.includes('nodes=node-0%2Cnode-1%2Cnode-2')`), 'copied comparison link did not preserve the current analysis context');
+
+    await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/?view=theme-manage` });
+    await waitUntil(cdp, `document.body.innerText.includes('Blackwhite 工作室')`, 8_000);
+    await cdp.value(`Array.from(document.querySelectorAll('.studio-quick-start-actions button')).find(button => button.textContent.includes('日常巡检')).click()`);
+    await waitUntil(cdp, `document.querySelector('.blackwhite-studio-heading h1').textContent.includes('巡检') && document.querySelector('.blackwhite-studio-state span').dataset.dirty === 'true'`, 2_000);
+    failGate(await cdp.value(`(() => { const switches = Array.from(document.querySelectorAll('.studio-overview-editor input[role="switch"]')); return switches[0]?.checked === true && switches[1]?.checked === true && switches[2]?.checked === false; })()`), 'inspection starter preset did not apply its stated homepage defaults');
+    await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-savebar button')).find(button => button.textContent.includes('撤销修改')).click()`);
+    await waitUntil(cdp, `document.querySelector('.blackwhite-studio-state span').dataset.dirty === 'false'`, 2_000);
+    await cdp.value(`Array.from(document.querySelectorAll('.studio-quick-start-actions button')).find(button => button.textContent.includes('公开展示')).click()`);
+    await waitUntil(cdp, `document.querySelector('.blackwhite-studio-state span').dataset.dirty === 'true'`, 2_000);
+    failGate(await cdp.value(`(() => { const switches = Array.from(document.querySelectorAll('.studio-overview-editor input[role="switch"]')); return switches[0]?.checked === true && switches[1]?.checked === false && switches[2]?.checked === true; })()`), 'showcase starter preset did not apply its stated homepage defaults');
+    await cdp.value(`Array.from(document.querySelectorAll('.blackwhite-studio-savebar button')).find(button => button.textContent.includes('撤销修改')).click()`);
+    await waitUntil(cdp, `document.querySelector('.blackwhite-studio-state span').dataset.dirty === 'false'`, 2_000);
+    await cdp.value(`scrollTo(0, 0)`);
+    await captureScreenshot(cdp, `${screenshotBase}-theme-settings.png`);
+    await cdp.call("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    await captureScreenshot(cdp, `${screenshotBase}-studio-mobile.png`);
+    failGate(await cdp.value(`document.documentElement.scrollWidth <= innerWidth + 1`), 'Studio overflows mobile viewport');
+    for (const [device, width, height] of [['desktop', 1440, 1000], ['mobile', 390, 844]]) {
+      await cdp.call('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: device === 'mobile' });
+      for (const [index, section] of ['appearance', 'overview', 'views', 'assets', 'network'].entries()) {
+        await cdp.value(`document.querySelectorAll('.blackwhite-studio-nav nav button')[${index}].click()`);
+        await waitUntil(cdp, `document.activeElement === document.querySelector('.blackwhite-studio-heading h1')`, 2_000);
+        failGate(await cdp.value(`document.documentElement.scrollWidth <= innerWidth + 1`), `Studio ${section} overflows ${device} viewport`);
+        await captureScreenshot(cdp, `${screenshotBase}-studio-${section}-${device}.png`);
+      }
+    }
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify('crystal-dark'))`);
+    await cdp.call('Page.reload');
+    await waitUntil(cdp, `document.documentElement.dataset.appearance === 'dark' && document.querySelector('.blackwhite-studio-nav') !== null`, 8_000);
+    for (const [device, width, height] of [['desktop', 1440, 1000], ['mobile', 390, 844]]) {
+      await cdp.call('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: device === 'mobile' });
+      for (const [index, section] of ['appearance', 'overview', 'views', 'assets', 'network'].entries()) {
+        await cdp.value(`document.querySelectorAll('.blackwhite-studio-nav nav button')[${index}].click()`);
+        await waitUntil(cdp, `document.activeElement === document.querySelector('.blackwhite-studio-heading h1')`, 2_000);
+        failGate(await cdp.value(`document.documentElement.scrollWidth <= innerWidth + 1`), `Studio ${section} overflows ${device} viewport`);
+        await captureScreenshot(cdp, `${screenshotBase}-studio-${section}-${device}-dark.png`);
+      }
+    }
+    await cdp.value(`localStorage.setItem('appearance', JSON.stringify('crystal-light'))`);
+
+
+
+
+    await cdp.call("Emulation.setDeviceMetricsOverride", {
+      width: 430,
+      height: 932,
+      deviceScaleFactor: 1,
+      mobile: true,
+    });
+    await cdp.call("Page.navigate", { url: `http://127.0.0.1:${address.port}/` });
+    await waitUntil(cdp, `document.querySelectorAll('.home-node-card-slot').length === 8`, 8_000);
+    await captureScreenshot(cdp, `${screenshotBase}-overview-mobile.png`);
+  }
+  if (!process.env.BROWSER_REPORT_GATES_ONLY) results.push({ uiRegressions: "persistent operations summary, evidence deep links, recoverable comparison presets, starter studio presets, time-zone-aware load/Ping ranges, online summary, draggable ordering, VPS task save/reload, cross-category filtering, keyboard VPS search" });
+  }
+  if (!process.env.BROWSER_REPORT_GATES_ONLY) {
+    await clearFixturePage(cdp);
+    activeFixture = {backend: BACKEND_PROFILES.official.id, nodes: 1, aurora: true, crystal: true, luminousReference: true, workspaceMetrics: true, reports: true, ui: true, docs: true, run: "crystal", auroraHistoryPoints: 9, auroraQuotaFractions: [0.6]};
+    savedUiSettings = {defaultAppearance: "crystal-light", showHomeOverview: true, showCostSummary: true};
+    results.push(await checkCrystal({cdp, origin: `http://127.0.0.1:${address.port}`, waitUntil, failGate, setFixture: patch => {activeFixture = {...activeFixture, ...patch};}}));
+  }
+  }
+  console.log(JSON.stringify(results, null, 2));
+} finally {
+  cdp?.close();
+  if (!chromeExit) {
+    await new Promise((resolve) => {
+      const onExit = () => resolve();
+      child.once("exit", onExit);
+      if (chromeExit) {
+        child.off("exit", onExit);
+        resolve();
+        return;
+      }
+      child.kill("SIGTERM");
+    });
+  }
+  server.close();
+  await removeBrowserProfile(profile);
+}

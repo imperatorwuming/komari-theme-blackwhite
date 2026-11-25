@@ -1,0 +1,35 @@
+{
+  "name": {
+    "zh_CN": "Blackwhite 网络观测",
+    "en": "Blackwhite Network Observatory"
+  },
+  "short": "blackwhite-network-observatory",
+  "description": "为 Blackwhite 提供计划式网络观测；完整 TcpQuality 和 NodeQuality 检测需要显式启用本机特权执行器。",
+  "author": "imperatorwuming",
+  "version": "1.0.0",
+  "url": "https://github.com/imperatorwuming/komari-theme-blackwhite",
+  "entry": "script.js",
+  "komari": ">=1.4.3",
+  "permissions": {
+    "node": true,
+    "allowRoutes": true,
+    "timeout": 30,
+    "maxHTTPBodyBytes": 8388608,
+    "allowSystemRPC": true
+  },
+  "configuration": {
+    "type": "managed",
+    "data": []
+  },
+  "pages": [
+    {
+      "title": {
+        "zh_CN": "网络观测",
+        "en": "Network Observatory"
+      },
+      "type": "redirect",
+      "url": "/?view=theme-manage&section=network",
+      "visibility": "admin"
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+import { describe, expect, it } from "vitest";
+import { buildHomeTrafficOverview, getHomeTrafficDateKey, getHomeTrafficPeriodStart, getHomeTrafficQueryRange, getHomeTodayTrafficQueryRange, summarizeHomeTodayTraffic } from "@/utils/trafficOverview";
+
+const NOW = new Date(2026, 5, 28, 12, 0, 0, 0).getTime();
+
+describe("home traffic overview", () => {
+  it("calculates today and month traffic from cumulative counters", () => {
+    const todayStart = getHomeTrafficPeriodStart("today", NOW);
+    const monthStart = getHomeTrafficPeriodStart("month", NOW);
+    const rows = buildHomeTrafficOverview(
+      [{
+        uuid: "node-a",
+        name: "Node A",
+        group: "prod",
+        region: "HK",
+    online: true,
+    updatedAt: 1_700_000_000_000,
+        netUp: 100,
+        netDown: 50,
+        trafficUp: 1_500,
+        trafficDown: 2_000,
+        expiredAt: "",
+      }],
+      {
+        "node-a": [
+          { time: monthStart - 1_000, net_total_up: 300, net_total_down: 600 } as never,
+          { time: todayStart - 1_000, net_total_up: 1_000, net_total_down: 1_500 } as never,
+          { time: NOW - 1_000, net_total_up: 1_400, net_total_down: 1_900 } as never,
+        ],
+      },
+      NOW,
+    );
+
+    expect(rows[0]?.today).toEqual({ up: 500, down: 500, total: 1_000, quality: "measured", coverageStart: todayStart - 1_000 });
+    expect(rows[0]?.month).toEqual({ up: 1_200, down: 1_400, total: 2_600, quality: "measured", coverageStart: monthStart - 1_000 });
+    expect(rows[0]?.total).toEqual({ up: 1_500, down: 2_000, total: 3_500, quality: "measured", coverageStart: null });
+  });
+
+  it("uses the configured calendar time zone for period boundaries", () => {
+    const now = Date.parse("2026-06-28T03:00:00Z");
+    expect(new Date(getHomeTrafficPeriodStart("today", now, "Asia/Shanghai")).toISOString())
+      .toBe("2026-06-27T16:00:00.000Z");
+    expect(new Date(getHomeTrafficPeriodStart("today", now, "America/Los_Angeles")).toISOString())
+      .toBe("2026-06-27T07:00:00.000Z");
+    expect(getHomeTrafficDateKey(now, "Asia/Shanghai")).toBe("2026-06-28");
+    expect(getHomeTrafficDateKey(now, "America/Los_Angeles")).toBe("2026-06-27");
+  });
+
+  it("limits the homepage history query to the current month and at most 30 days", () => {
+    const lateInMonth = Date.parse("2026-07-31T18:00:00Z");
+    const range = getHomeTrafficQueryRange(lateInMonth, "UTC");
+    expect(range.end).toBe(lateInMonth);
+    expect(range.start).toBe(lateInMonth - 30 * 24 * 60 * 60 * 1_000);
+
+    const earlyInMonth = Date.parse("2026-07-05T18:00:00Z");
+    const earlyRange = getHomeTrafficQueryRange(earlyInMonth, "UTC");
+    expect(earlyRange.start).toBe(getHomeTrafficPeriodStart("month", earlyInMonth, "UTC") - 15 * 60_000);
+  });
+
+  it("keeps today's counter query dense and within a 24-hour window", () => {
+    const now = Date.parse("2026-07-05T18:00:00Z");
+    const range = getHomeTodayTrafficQueryRange(now, "UTC");
+    expect(range.end).toBe(now);
+    expect(range.start).toBe(getHomeTrafficPeriodStart("today", now, "UTC") - 15 * 60_000);
+    expect(range.end - range.start).toBeLessThanOrEqual(24 * 60 * 60 * 1_000);
+  });
+
+  it("treats a counter reset as usage since the reset", () => {
+    const rows = buildHomeTrafficOverview(
+      [{
+        uuid: "node-a",
+        name: "Node A",
+        group: "",
+        region: "",
+    online: true,
+    updatedAt: 1_700_000_000_000,
+        netUp: 20,
+        netDown: 8,
+        trafficUp: 20,
+        trafficDown: 8,
+        expiredAt: "",
+      }],
+      {
+        "node-a": [
+          { time: NOW - 60_000, net_total_up: 900, net_total_down: 700 } as never,
+          { time: NOW - 1_000, net_total_up: 10, net_total_down: 4 } as never,
+        ],
+      },
+      NOW,
+    );
+
+    expect(rows[0]?.today).toMatchObject({ up: 20, down: 8, total: 28 });
+    expect(rows[0]?.today.quality).toBe("partial");
+  });
+
+  it("does not substitute cumulative counters for missing period history", () => {
+    const rows = buildHomeTrafficOverview(
+      [{
+        uuid: "node-a",
+        name: "Node A",
+        group: "",
+        region: "",
+        online: true,
+        updatedAt: NOW,
+        netUp: 10,
+        netDown: 5,
+        trafficUp: 5_000,
+        trafficDown: 8_000,
+        expiredAt: "",
+      }],
+      {},
+      NOW,
+    );
+
+    expect(rows[0]?.today.total).toBe(0);
+    expect(rows[0]?.today.quality).toBe("unavailable");
+    expect(rows[0]?.month.quality).toBe("unavailable");
+    expect(rows[0]?.total.total).toBe(13_000);
+  });
+
+  it("marks usage partial when the first sample starts after the period boundary", () => {
+    const todayStart = getHomeTrafficPeriodStart("today", NOW);
+    const rows = buildHomeTrafficOverview(
+      [{
+        uuid: "node-a",
+        name: "Node A",
+        group: "",
+        region: "",
+        online: true,
+        updatedAt: NOW,
+        netUp: 30,
+        netDown: 15,
+        trafficUp: 30,
+        trafficDown: 15,
+        expiredAt: "",
+      }],
+      {
+        "node-a": [
+          { time: todayStart + 30 * 60_000, net_total_up: 100, net_total_down: 50 } as never,
+        ],
+      },
+      NOW,
+    );
+
+    expect(rows[0]?.today.total).toBe(45);
+    expect(rows[0]?.today.quality).toBe("partial");
+    expect(rows[0]?.today.coverageStart).toBe(todayStart + 30 * 60_000);
+  });
+
+  it("accepts an actual sample exactly at midnight as a complete period boundary", () => {
+    const start = getHomeTrafficPeriodStart("today", NOW);
+    const node = { uuid: "node-a", name: "A", group: "", region: "", online: true, updatedAt: NOW, netUp: 0, netDown: 0, trafficUp: 1500, trafficDown: 2000, expiredAt: "" };
+    const [row] = buildHomeTrafficOverview([node], { "node-a": [
+      { time: start, net_total_up: 1000, net_total_down: 1500 } as never,
+      { time: NOW - 1000, net_total_up: 1400, net_total_down: 1900 } as never,
+    ] }, NOW);
+    expect(row?.today).toEqual({ up: 500, down: 500, total: 1000, quality: "measured", coverageStart: start });
+  });
+
+  it("sums every usable ranking value and reports partial and missing node counts", () => {
+    const node = { uuid: "a", name: "A", group: "", region: "", online: true, updatedAt: NOW, netUp: 0, netDown: 0, trafficUp: 0, trafficDown: 0, expiredAt: "" };
+    const rows = buildHomeTrafficOverview([node, { ...node, uuid: "b" }, { ...node, uuid: "c" }], {}, NOW);
+    rows[0]!.today = { up: 30, down: 70, total: 100, quality: "measured", coverageStart: NOW };
+    rows[1]!.today = { up: 20, down: 30, total: 50, quality: "partial", coverageStart: NOW };
+    expect(summarizeHomeTodayTraffic(rows)).toEqual({ total: 150, available: 2, partial: 1, unavailable: 1 });
+    rows[1]!.today = { up: 0, down: 0, total: 0, quality: "measured", coverageStart: NOW };
+    rows[2]!.today = { up: 0, down: 0, total: 0, quality: "measured", coverageStart: NOW };
+    expect(summarizeHomeTodayTraffic(rows)).toEqual({ total: 100, available: 3, partial: 0, unavailable: 0 });
+  });
+});

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check opt-in Blackwhite runner maintenance hourly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=blackwhite-network-observatory-update.service
+
+[Install]
+WantedBy=timers.target

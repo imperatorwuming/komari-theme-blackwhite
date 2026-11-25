@@ -1,0 +1,21 @@
+[Unit]
+Description=Blackwhite authenticated HTTPS speed counterpart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blackwhite-netobs
+Group=blackwhite-netobs
+ExecStart=/usr/bin/python3 /usr/local/libexec/blackwhite-network-observatory/http_receiver.py --config /etc/blackwhite-network-observatory/http-receiver.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

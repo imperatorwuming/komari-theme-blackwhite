@@ -1,0 +1,43 @@
+#!/sbin/openrc-run
+
+description="Blackwhite outbound network observatory worker"
+supervisor="supervise-daemon"
+command="/usr/bin/python3"
+config="/etc/blackwhite-network-observatory/agent.json"
+case "$RC_SVCNAME" in
+  blackwhite-network-observatory) ;;
+  blackwhite-network-observatory-probe-*)
+    probe_id=${RC_SVCNAME#blackwhite-network-observatory-probe-}
+    case "$probe_id" in ''|*[!a-fA-F0-9-]*) exit 1 ;; esac
+    [ "${#probe_id}" -eq 36 ] || exit 1
+    config="/etc/blackwhite-network-observatory/probe-${probe_id}.json" ;;
+  *) exit 1 ;;
+esac
+command_args="-B /usr/local/libexec/blackwhite-network-observatory/agent.py run --config ${config}"
+command_user="blackwhite-netobs:blackwhite-netobs"
+umask=0077
+# OpenRC uses libcap's IAB syntax, not the setcap '=ep' format.
+# Retain RAW across exec and remove every other capability from the bound.
+capabilities="^cap_net_raw"
+cap_index=0
+cap_last=$(cat /proc/sys/kernel/cap_last_cap)
+while [ "$cap_index" -le "$cap_last" ]; do
+  [ "$cap_index" -eq 13 ] || capabilities="${capabilities},!${cap_index}"
+  cap_index=$((cap_index + 1))
+done
+no_new_privs=yes
+respawn_delay=10
+respawn_max=0
+retry="TERM/35/KILL/5"
+output_logger="logger -t ${RC_SVCNAME}"
+error_logger="$output_logger"
+
+depend() {
+  need net
+}
+
+start_pre() {
+  [ -f "$config" ] || { eerror "Missing worker credentials: $config; run agent.py configure first"; return 1; }
+  checkpath --directory --mode 0750 --owner root:blackwhite-netobs /var/lib/blackwhite-network-observatory
+  /usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/agent.py prepare --config "$config"
+}

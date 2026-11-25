@@ -1,0 +1,31 @@
+[Unit]
+Description=Blackwhite Network Observatory mainland controlled probe %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=blackwhite-netobs
+Group=blackwhite-netobs
+ExecStartPre=+/usr/bin/python3 /usr/local/libexec/blackwhite-network-observatory/agent.py prepare --config /etc/blackwhite-network-observatory/probe-%i.json
+ExecStart=/usr/bin/python3 /usr/local/libexec/blackwhite-network-observatory/agent.py run --config /etc/blackwhite-network-observatory/probe-%i.json
+Restart=always
+RestartSec=10s
+UMask=0077
+ReadWritePaths=/var/lib/blackwhite-network-observatory
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_PACKET
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

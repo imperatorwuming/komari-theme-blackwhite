@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta
+      name="keywords"
+      content="komari-theme-blackwhite, Black · White, server monitor, real-time server status, server performance dashboard, monitoring tool" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="komari-theme-blackwhite" />
+    <meta property="og:title" content="komari-theme-blackwhite" />
+    <meta property="og:description" content="Blackwhite — server monitoring and asset management for Komari." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="komari-theme-blackwhite" />
+    <meta name="twitter:description" content="Blackwhite — server monitoring and asset management for Komari." />
+    <title>komari-theme-blackwhite</title>
+    <meta name="description" content="Blackwhite — server monitoring and asset management for Komari." />
+    <script>
+      // Preview documents must never read or write the outer site's preferences.
+      if (window.parent !== window && new URLSearchParams(location.search).get('blackwhite-preview') === '1') {
+        for (const name of ['localStorage', 'sessionStorage']) {
+          const values = new Map();
+          Object.defineProperty(window, name, { value: {
+            get length() { return values.size; },
+            key(index) { return Array.from(values.keys())[index] ?? null; },
+            getItem(key) { return values.get(String(key)) ?? null; },
+            setItem(key, value) { values.set(String(key), String(value)); },
+            removeItem(key) { values.delete(String(key)); },
+            clear() { values.clear(); }
+          } });
+        }
+      }
+    </script>
+    <script>
+      (() => {
+        const appearances = ["crystal-light", "crystal-dark"];
+        const parseAppearance = (value) => {
+          if (value == null) return null;
+          try {
+            const parsed = JSON.parse(value);
+            return appearances.includes(parsed) ? parsed : null;
+          } catch {
+            return appearances.includes(value) ? value : null;
+          }
+        };
+
+        let appearance = "crystal-light";
+        try {
+          const explicitAppearance = parseAppearance(localStorage.getItem("appearance"));
+          const cachedDefaultAppearance = parseAppearance(
+            localStorage.getItem("appearance_default"),
+          );
+          if (explicitAppearance != null) {
+            appearance = explicitAppearance;
+            localStorage.setItem("appearance", JSON.stringify(explicitAppearance));
+          } else if (cachedDefaultAppearance != null) {
+            appearance = cachedDefaultAppearance;
+            localStorage.setItem(
+              "appearance_default",
+              JSON.stringify(cachedDefaultAppearance),
+            );
+          }
+        } catch {
+          appearance = "crystal-light";
+        }
+        const resolved = appearance === "crystal-dark" ? "dark" : "light";
+        const root = document.documentElement;
+        root.dataset.appearance = resolved;
+        root.dataset.themeStyle = appearance;
+        root.dataset.layoutStyle = "cupertino";
+        root.style.colorScheme = resolved;
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.content = resolved === "dark" ? "#0b111c" : "#edf3fc";
+
+        // Apply the cached custom background + card transparency before first
+        // paint so a refresh doesn't flash the solid theme before React mounts.
+        // Mirror of applyBackgroundCache() in src/utils/background.ts.
+        try {
+          const rawBg = localStorage.getItem("komaritheme:bg");
+          if (rawBg) {
+            const bg = JSON.parse(rawBg);
+            if (bg && bg.v === 1) {
+              const dark = resolved === "dark";
+              const desktop = dark ? bg.darkDesktop : bg.lightDesktop;
+              const mobile = (dark ? bg.darkMobile : bg.lightMobile) || desktop;
+              const style = document.documentElement.style;
+              style.setProperty("--bg-image-desktop", desktop || "none");
+              style.setProperty("--bg-image-mobile", mobile || "none");
+              style.setProperty("--bg-size", bg.size || "cover");
+              style.setProperty("--bg-position", bg.position || "center");
+              style.setProperty("--surface-alpha", bg.alpha || "100");
+              if (bg.blur) {
+                style.setProperty("--surface-blur", bg.blur);
+                document.documentElement.dataset.bgGlass = "true";
+              }
+              if (bg.scrim) style.setProperty("--bg-scrim", bg.scrim);
+            }
+          }
+        } catch {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root" class="relative z-30"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

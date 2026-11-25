@@ -1,0 +1,18 @@
+[Unit]
+Description=Blackwhite credential-preserving runner maintenance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Only the local package-manager step needs writable system paths.
+ExecStartPre=-+/usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/updater.py repair-diagnostics
+ExecStart=/usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/updater.py auto
+TimeoutStartSec=8min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/usr/local/libexec/blackwhite-network-observatory /var/lib/blackwhite-network-observatory /etc/systemd/system
+PrivateTmp=true
+UMask=0077

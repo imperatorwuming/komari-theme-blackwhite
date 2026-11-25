@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+# A dedicated BusyBox cron spool avoids a second resident Python worker.
+description="Blackwhite opt-in hourly runner maintenance"
+supervisor="supervise-daemon"
+command="/usr/sbin/crond"
+command_args="-f -c /etc/blackwhite-network-observatory/cron"
+respawn_delay=10
+respawn_max=0
+retry="TERM/10/KILL/5"
+umask=0077
+
+depend() {
+  need net
+}
+
+start_pre() {
+  checkpath --directory --mode 0700 --owner root:root /etc/blackwhite-network-observatory/cron || return 1
+  # The worker is unprivileged and needs to traverse this directory to reach
+  # its own protected outbox. Do not undo its permissions when cron restarts.
+  checkpath --directory --mode 0750 --owner root:blackwhite-netobs /var/lib/blackwhite-network-observatory || return 1
+  # One persisted minute per host, including before first credential setup.
+  # Keep every local identity on the same scheduler and avoid a fleet-wide :17
+  # burst. BusyBox already provides od; unavailable randomness falls back to :17.
+  minute_file=/var/lib/blackwhite-network-observatory/update-minute
+  minute=
+  if [ -r "$minute_file" ]; then IFS= read -r minute < "$minute_file" || minute=; fi
+  case "$minute" in
+    [0-9]|[1-5][0-9]) ;;
+    *)
+      minute=17
+      if command -v od >/dev/null 2>&1; then
+        seed=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null) || seed=
+        set -- $seed
+        case "${1:-}" in ''|*[!0-9]*) ;; *) minute=$(($1 % 60)) ;; esac
+      fi
+      printf '%s\n' "$minute" > "${minute_file}.tmp" || return 1
+      chmod 0600 "${minute_file}.tmp" || return 1
+      mv -f "${minute_file}.tmp" "$minute_file" || return 1
+      ;;
+  esac
+  printf '%s\n' "$minute * * * * /usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/updater.py auto" > /etc/blackwhite-network-observatory/cron/root
+  chmod 0600 /etc/blackwhite-network-observatory/cron/root
+  /usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/updater.py recover
+}

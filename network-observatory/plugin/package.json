@@ -1,0 +1,8 @@
+{
+  "name": "blackwhite-network-observatory-plugin",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node --test tests/*.node.cjs"
+  }
+}

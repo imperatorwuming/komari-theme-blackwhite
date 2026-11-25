@@ -1,0 +1,109 @@
+import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import zlib from "node:zlib";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const plugin = resolve(root, "network-observatory/plugin");
+const manifest = JSON.parse(readFileSync(resolve(plugin, "komari-plugin.json"), "utf8"));
+const runnerRelease = JSON.parse(readFileSync(resolve(plugin, "src/runner-release.json"), "utf8"));
+const runnerSource = readFileSync(resolve(root, "network-observatory/runner/agent.py"), "utf8");
+const expectedArchive = `Blackwhite-Network-Observatory-v${manifest.version}.zip`;
+if (runnerRelease.archive !== expectedArchive || runnerSource.match(/^RUNNER_VERSION = "([^"]+)"$/m)?.[1] !== runnerRelease.version) {
+  throw new Error("Probe release metadata does not match the packaged plugin and runner");
+}
+
+const files = [
+  ...["updater.py", "blackwhite-network-observatory-update.service", "blackwhite-network-observatory-update.timer", "blackwhite-network-observatory-update.openrc"].map((name) => [`runner/${name}`, resolve(root, `network-observatory/runner/${name}`)]),
+  ["runner/release.json", resolve(plugin, "src/runner-release.json")],
+  ["src/runner-release.json", resolve(plugin, "src/runner-release.json")],
+  ...["blackwhite-network-observatory.openrc", "blackwhite-network-observatory-http.openrc"].map((name) => [`runner/${name}`, resolve(root, `network-observatory/runner/${name}`)]),
+  ["komari-plugin.json", resolve(plugin, "komari-plugin.json")],
+  ["script.js", resolve(plugin, "script.js")],
+  ["src/route-networks.json", resolve(plugin, "src/route-networks.json")],
+  ["src/model.js", resolve(plugin, "src/model.js")],
+  ...["json-state", "native-queue-state", "catalog", "native-model", "native-controller", "globalping", "route-enrichment", "route-evidence", "website-catalog", "round-store", "retention-store", "report-catalog", "report-model", "report-controller", "report-assets", "home-routes", "home-speeds", "report-resources", "report-share", "bgp"].map((name) => [`src/${name}.js`, resolve(plugin, `src/${name}.js`)]),
+  ["src/timezones.json", resolve(plugin, "src/timezones.json")],
+  ["src/home-diagnostics.js", resolve(plugin, "src/home-diagnostics.js")],
+  ["runner/blackwhite-network-observatory-http.service", resolve(root, "network-observatory/runner/blackwhite-network-observatory-http.service")],
+  ["runner/http_receiver.py", resolve(root, "network-observatory/runner/http_receiver.py")],
+  ["runner/public_speed.py", resolve(root, "network-observatory/runner/public_speed.py")],
+  ...["tcpquality_full.py", "nodequality_full.py", "tcpquality_helper.py", "blackwhite-network-observatory-tcpquality.service", "blackwhite-network-observatory-tcpquality.openrc"].map((name) => [`runner/${name}`, resolve(root, `network-observatory/runner/${name}`)]),
+  ["runner/tcp_quality.py", resolve(root, "network-observatory/runner/tcp_quality.py")],
+  ["runner/native.py", resolve(root, "network-observatory/runner/native.py")],
+  ["runner/agent.py", resolve(root, "network-observatory/runner/agent.py")],
+  ["runner/install.sh", resolve(root, "network-observatory/runner/install.sh")],
+  ["runner/quick-install.sh", resolve(root, "network-observatory/runner/quick-install.sh")],
+  ["runner/blackwhite-network-observatory-agent.service", resolve(root, "network-observatory/runner/blackwhite-network-observatory-agent.service")],
+  ["runner/blackwhite-network-observatory-probe@.service", resolve(root, "network-observatory/runner/blackwhite-network-observatory-probe@.service")],
+  ["README.md", resolve(root, "network-observatory/README.md")],
+];
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const localParts = [];
+const centralParts = [];
+let offset = 0;
+for (const [archivePath, diskPath] of files) {
+  const name = Buffer.from(archivePath, "utf8");
+  const file = readFileSync(diskPath);
+  const content = archivePath === "README.md"
+    ? Buffer.from(file.toString("utf8").replace(/\]\(\.\.\/([^)]+)\)/g, (_, relativePath) => {
+        const view = /\.(?:jpg|png|webp)$/.test(relativePath) ? "raw" : "blob";
+        return `](${manifest.url}/${view}/${runnerRelease.releaseTag}/${relativePath})`;
+      }))
+    : file;
+  const compressed = zlib.deflateRawSync(content, { level: 9 });
+  const crc = crc32(content);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(0x0800, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(compressed.length, 18);
+  local.writeUInt32LE(content.length, 22);
+  local.writeUInt16LE(name.length, 26);
+  localParts.push(local, name, compressed);
+
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(0x0800, 8);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(content.length, 24);
+  central.writeUInt16LE(name.length, 28);
+  central.writeUInt32LE(offset, 42);
+  centralParts.push(central, name);
+  offset += local.length + name.length + compressed.length;
+}
+
+const centralDirectory = Buffer.concat(centralParts);
+const end = Buffer.alloc(22);
+end.writeUInt32LE(0x06054b50, 0);
+end.writeUInt16LE(files.length, 8);
+end.writeUInt16LE(files.length, 10);
+end.writeUInt32LE(centralDirectory.length, 12);
+end.writeUInt32LE(offset, 16);
+const outputPath = resolve(root, expectedArchive);
+writeFileSync(outputPath, Buffer.concat([...localParts, centralDirectory, end]));
+const latestPath = resolve(root, "Blackwhite-Network-Observatory-latest.zip");
+const installerPath = resolve(root, "Blackwhite-Network-Observatory-install.sh");
+copyFileSync(outputPath, latestPath);
+copyFileSync(resolve(root, "network-observatory/runner/quick-install.sh"), installerPath);
+for (const path of [outputPath, latestPath, installerPath]) {
+  const digest = createHash("sha256").update(readFileSync(path)).digest("hex");
+  writeFileSync(`${path}.sha256`, `${digest}  ${path.split("/").at(-1)}\n`);
+}
+console.log(`Wrote ${outputPath}`);

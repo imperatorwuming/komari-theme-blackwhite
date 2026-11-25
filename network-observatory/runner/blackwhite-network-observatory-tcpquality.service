@@ -1,0 +1,18 @@
+[Unit]
+Description=Blackwhite isolated complete network test execution helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -B /usr/local/libexec/blackwhite-network-observatory/tcpquality_helper.py
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

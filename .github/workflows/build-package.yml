@@ -1,0 +1,137 @@
+name: Build theme package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin the source surfaces that the official-adapter contract was audited
+      # against. The theme only talks to the server, but its node status is
+      # projected from the agent v2 report protocol, so validate both sides.
+      - name: Checkout audited official Komari source surface
+        uses: actions/checkout@v4
+        with:
+          repository: komari-monitor/komari
+          ref: b11ffd3aa7cca03502a75eb64ecbe827d6831d3a
+          path: .upstream/komari
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          sparse-checkout: |
+            web/rpc/jsonrpc
+            web/router
+            web/public
+            web/api/admin
+            web/api/client
+            database/models
+            internal/metricstore
+            pkg/rpc
+            protocol/v2
+
+      - name: Checkout audited official Komari agent source surface
+        uses: actions/checkout@v4
+        with:
+          repository: komari-monitor/komari-agent
+          ref: f7c16a94ba7dd3ce57fbe86c6131d995f645d8d8
+          path: .upstream/komari-agent
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          sparse-checkout: |
+            protocol/v2
+            server
+            monitoring
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Go for official plugin runtime checks
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: scripts/plugin-runtime/go.mod
+          cache-dependency-path: scripts/plugin-runtime/go.sum
+
+      - name: Install dependencies
+        run: npm ci
+
+      # A tag is a release candidate, not merely a packaging trigger.  Keep
+      # every release artifact behind the same full gate used locally.
+      - name: Run release gates
+        run: npm run test:release-gates
+
+      - name: Verify Komari 1.4.3 and 1.5.1 plugin runtimes
+        run: npm run test:plugin-runtime
+
+      - name: Verify official upstream compatibility surface
+        env:
+          KOMARI_UPSTREAM_DIR: ${{ github.workspace }}/.upstream/komari
+          KOMARI_AGENT_UPSTREAM_DIR: ${{ github.workspace }}/.upstream/komari-agent
+        run: npm run test:upstream-contract
+
+      - name: Build package
+        run: npm run package
+
+      - name: Verify Alpine 3.21 OpenRC runner with 128 MiB
+        run: npm run test:alpine-runner
+
+      - name: Verify systemd runner upgrade and rollback
+        run: sudo env GITHUB_ACTIONS=true BLACKWHITE_TEST_SYSTEMD=1 BLACKWHITE_FIXTURE_ROOT="$GITHUB_WORKSPACE" sh scripts/test-systemd-runner.sh
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: komari-theme-blackwhite-package
+          path: |
+            komari-theme-blackwhite-v*.zip
+            Blackwhite-Network-Observatory-v*.zip
+            Blackwhite-Network-Observatory-v*.zip.sha256
+            Blackwhite-Network-Observatory-latest.zip
+            Blackwhite-Network-Observatory-latest.zip.sha256
+            Blackwhite-Network-Observatory-install.sh
+            Blackwhite-Network-Observatory-install.sh.sha256
+            preview.png
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          notes=".github/release-notes/$tag.md"
+          assets=(
+            "komari-theme-blackwhite-$tag.zip"
+            Blackwhite-Network-Observatory-v*.zip
+            Blackwhite-Network-Observatory-v*.zip.sha256
+            Blackwhite-Network-Observatory-latest.zip
+            Blackwhite-Network-Observatory-latest.zip.sha256
+            Blackwhite-Network-Observatory-install.sh
+            Blackwhite-Network-Observatory-install.sh.sha256
+            preview.png
+          )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          elif [[ -f "$notes" ]]; then
+            gh release create "$tag" "${assets[@]}" --verify-tag --title "komari-theme-blackwhite $tag" --notes-file "$notes"
+          else
+            gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes
+          fi

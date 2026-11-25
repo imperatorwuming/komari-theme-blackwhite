@@ -1,0 +1,844 @@
+import { isDarkAppearance } from "@/utils/themeSettings";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import UplotReact from "uplot-react";
+import type uPlot from "uplot";
+import { ArrowDown, ArrowUp, Cpu, Gauge, HardDrive, MemoryStick, Network, RefreshCw, Workflow } from "lucide-react";
+import { useLoadRecords } from "@/hooks/useRecords";
+import { useNodeMeta, useNodeMetrics } from "@/hooks/useNode";
+import { InstancePanel, InstanceChartLoading } from "./InstancePanel";
+import {
+  buildChartTooltipHooks,
+  createTimeAxisFormatter,
+  formatChartCoverageTime,
+  getAxisColors,
+  toChartSeconds,
+  useResponsiveChartSize,
+  type ChartTooltipState,
+} from "./chartShared";
+import {
+  fillMissingMetricPoints,
+  interpolateMetricGaps,
+} from "./chartData";
+import {
+  formatBytes,
+  formatLoadValue,
+  formatMetricNumber,
+  formatMetricPercent,
+  formatTrafficRateLabel,
+} from "@/utils/format";
+import { usePreferences } from "@/hooks/usePreferences";
+import { useThemeSettings } from "@/hooks/useThemeSettings";
+import type { NodeMetrics } from "@/types/komari";
+import type { DisplayTimeZone } from "@/utils/timeDisplay";
+import type { PingTimeRange } from "@/utils/pingTimeRange";
+
+const LOAD_HISTORY_SAMPLE_LIMIT = 360;
+const LOAD_HISTORY_RENDER_LIMIT = 720;
+const REALTIME_HISTORY_SEED_LIMIT = 120;
+const REALTIME_SAMPLE_LIMIT = 600;
+
+const CPU_KEYS = ["cpu"];
+const MEMORY_KEYS = ["ram", "swap"];
+const DISK_KEYS = ["disk"];
+const NETWORK_KEYS = ["netIn", "netOut"];
+const CONNECTION_KEYS = ["connections", "udp"];
+const PROCESS_KEYS = ["process"];
+const CUPERTINO_COLORS = { cpu: ["#007aff"], memory: ["#af52de", "#ff9500"], disk: ["#29b945"], network: ["#007aff", "#00b9bb"], connections: ["#007aff", "#00b9bb"], process: ["#007aff"] };
+const CUPERTINO_DARK_COLORS = { cpu: ["#0a84ff"], memory: ["#bf5af2", "#ff9f0a"], disk: ["#32d74b"], network: ["#0a84ff", "#64d2ff"], connections: ["#0a84ff", "#64d2ff"], process: ["#0a84ff"] };
+const SERIES_LABELS: Record<string, string> = {
+  cpu: "CPU",
+  ram: "内存",
+  swap: "Swap",
+  disk: "磁盘",
+  diskBytes: "磁盘",
+  netIn: "下行",
+  netOut: "上行",
+  connections: "TCP",
+  udp: "UDP",
+  process: "进程",
+  load: "负载",
+};
+const LOAD_INTERPOLATE_KEYS = [
+  "cpu",
+  "ram",
+  "swap",
+  "disk",
+  "diskBytes",
+  "netIn",
+  "netOut",
+  "connections",
+  "udp",
+  "process",
+  "load",
+];
+
+interface ChartPoint {
+  time: number;
+  [key: string]: number | null;
+}
+
+function metricData(points: ChartPoint[], keys: string[]): uPlot.AlignedData {
+  const times = points.map((point) => point.time);
+  return [times, ...keys.map((key) => points.map((point) => point[key] ?? null))] as uPlot.AlignedData;
+}
+
+function getHistoryRenderLimit(hours: number) {
+  if (hours <= 4) return LOAD_HISTORY_SAMPLE_LIMIT;
+  return LOAD_HISTORY_RENDER_LIMIT;
+}
+
+function downsamplePoints(points: ChartPoint[], limit: number) {
+  if (points.length <= limit || limit < 2) return points;
+
+  const result: ChartPoint[] = [];
+  const lastIndex = points.length - 1;
+  const step = lastIndex / (limit - 1);
+  let previousIndex = -1;
+
+  for (let index = 0; index < limit; index += 1) {
+    const sourceIndex = Math.min(lastIndex, Math.round(index * step));
+    if (sourceIndex === previousIndex) continue;
+    result.push(points[sourceIndex]);
+    previousIndex = sourceIndex;
+  }
+
+  return result;
+}
+
+function formatRangeSummary(hours: number) {
+  if (hours === 0) return "实时";
+  if (hours % 24 === 0) return `${hours / 24} 天`;
+  return `${hours} 小时`;
+}
+
+function getSeriesLabel(key: string) {
+  return SERIES_LABELS[key] ?? key;
+}
+
+function pointFromNode(node: NodeMetrics): ChartPoint {
+  return {
+    time: Date.now() / 1000,
+    cpu: node.cpuPct,
+    ram: node.ramTotal > 0 ? (node.ramUsed / node.ramTotal) * 100 : 0,
+    swap: node.swapTotal > 0 ? (node.swapUsed / node.swapTotal) * 100 : 0,
+    disk: node.diskTotal > 0 ? (node.diskUsed / node.diskTotal) * 100 : 0,
+    diskBytes: node.diskUsed,
+    netIn: node.netDown,
+    netOut: node.netUp,
+    connections: node.connectionsTcp,
+    udp: node.connectionsUdp,
+    process: node.process,
+    load: node.load1,
+  };
+}
+
+function formatTooltipValue(key: string, value: number | null | undefined, unit: string) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (key === "netIn" || key === "netOut") return formatTrafficRateLabel(value);
+  if (unit === "%") return formatMetricPercent(value);
+  if (key === "process" || key === "connections" || key === "udp") return `${Math.round(value)}`;
+  return key === "load" ? formatLoadValue(value) : formatMetricNumber(value);
+}
+
+function formatPercentAxisValue(value: number) {
+  return formatMetricPercent(value);
+}
+
+function formatNetworkAxisValue(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return formatTrafficRateLabel(value);
+}
+
+function formatCountAxisValue(value: number) {
+  return `${Math.round(value)}`;
+}
+
+// 不含尺寸的配置。width/height 由调用方在另一个 memo 里加上，resize 时只改这两个 key，
+// uplot-react 就会调 setSize() 而不是重建整个 chart。(用普通函数而非 hook——它不调任何
+// hook；之前的 `use` 前缀会触发 rules-of-hooks lint。)
+function buildBaseOptions({
+  title,
+  keys,
+  colors,
+  unit,
+  resolvedAppearance,
+  rangeHours,
+  xRange,
+  displayTimeZone,
+  spanGaps,
+  axisKind = "default",
+  axisSize = 68,
+}: {
+  title: string;
+  keys: string[];
+  colors: string[];
+  unit: string;
+  resolvedAppearance: "light" | "dark";
+  rangeHours: number;
+  xRange?: [number, number];
+  displayTimeZone: DisplayTimeZone;
+  spanGaps?: boolean;
+  axisKind?: "default" | "percent" | "network" | "count";
+  axisSize?: number;
+}): Omit<uPlot.Options, "width" | "height"> {
+  const isDark = resolvedAppearance === "dark";
+  const { grid, text } = getAxisColors(isDark);
+
+  return {
+    padding: [8, 18, 10, 8],
+    cursor: { drag: { x: true, y: false } },
+    legend: { show: false },
+    scales: {
+      x: { time: true, ...(xRange ? { auto: false, range: xRange } : {}) },
+      y: { auto: true },
+    },
+    axes: [
+      {
+        stroke: text,
+        grid: { stroke: grid, width: 1 },
+        ticks: { stroke: grid },
+        size: rangeHours >= 72 ? 38 : 34,
+        values: createTimeAxisFormatter(rangeHours, displayTimeZone),
+      },
+      {
+        stroke: text,
+        grid: { stroke: grid, width: 1 },
+        ticks: { stroke: grid },
+        size: axisSize,
+        values: (_self, splits) => {
+          return splits.map((value) => {
+            if (value === 0 && axisKind !== "percent") return "";
+            if (axisKind === "network") return formatNetworkAxisValue(value);
+            if (axisKind === "percent") return formatPercentAxisValue(value);
+            if (axisKind === "count") return formatCountAxisValue(value);
+            return value === 0 ? "" : formatMetricNumber(value, { unit });
+          });
+        },
+      },
+    ],
+    series: [
+      { label: "time" },
+      ...keys.map((key, index) => ({
+        label: key,
+        stroke: colors[index] ?? colors[0],
+        fill: index === 0 ? `${colors[index] ?? colors[0]}22` : undefined,
+        width: 1.6,
+        spanGaps: spanGaps ?? false,
+        points: { show: false },
+      })),
+    ],
+    hooks: {
+      init: [
+        (u) => {
+          u.root.setAttribute("aria-label", title);
+        },
+      ],
+    },
+  };
+}
+
+const ChartCard = memo(function ChartCard({
+  icon,
+  title,
+  value,
+  note,
+  uuid,
+  points,
+  keys,
+  colors,
+  width,
+  height,
+  resolvedAppearance,
+  rangeHours,
+  xRange,
+  displayTimeZone,
+  unit = "",
+  spanGaps,
+  axisKind,
+  axisSize,
+  selected = false,
+  active = true,
+  workspace = false,
+}: {
+  selected?: boolean;
+  active?: boolean;
+  workspace?: boolean;
+  icon: ReactNode;
+  title: string;
+  value: ReactNode;
+  note?: ReactNode;
+  uuid: string;
+  points: ChartPoint[];
+  keys: string[];
+  colors: string[];
+  width: number;
+  height: number;
+  resolvedAppearance: "light" | "dark";
+  rangeHours: number;
+  xRange?: [number, number];
+  displayTimeZone: DisplayTimeZone;
+  unit?: string;
+  spanGaps?: boolean;
+  axisKind?: "default" | "percent" | "network" | "count";
+  axisSize?: number;
+}) {
+  const [tooltip, setTooltip] = useState<ChartTooltipState>({
+    show: false,
+    left: 0,
+    top: 0,
+    rows: [],
+    time: "",
+  });
+  const data = useMemo(() => metricData(points, keys), [points, keys]);
+  const span =
+    data[0].length > 1 ? data[0][data[0].length - 1] - data[0][0] : 0;
+  const previousSpan = useRef(span);
+  // A lone live sample can arrive before history. Expand that initial domain
+  // once history is available; subsequent updates keep the user's zoom.
+  const seedHistoryScales = !xRange && previousSpan.current <= 1 && span > 1;
+  useEffect(() => {
+    previousSpan.current = span;
+  }, [span]);
+  const { w: measuredWidth, ref: plotRef } = useResponsiveChartSize(
+    workspace ? "workspace" : "grid",
+  );
+  const baseOptions = useMemo(
+    () =>
+      buildBaseOptions({
+        title,
+        keys,
+        colors,
+        unit,
+        resolvedAppearance,
+        rangeHours,
+        xRange,
+        displayTimeZone,
+        spanGaps,
+        axisKind,
+        axisSize,
+      }),
+    [
+      axisKind,
+      axisSize,
+      colors,
+      displayTimeZone,
+      keys,
+      rangeHours,
+      resolvedAppearance,
+      spanGaps,
+      title,
+      unit,
+      xRange,
+    ],
+  );
+
+  // 不含尺寸的增强配置 (base + 交互 hook)。resize 时保持稳定，最终对象上只有 width/height 变。
+  const enhancedOptions = useMemo<
+    Omit<uPlot.Options, "width" | "height">
+  >(() => {
+    const tooltip = buildChartTooltipHooks({
+      rangeHours,
+      displayTimeZone,
+      estimatedWidth: 176,
+      setTooltip,
+      buildRows: (idx, currentData) =>
+        keys.map((key, keyIndex) => ({
+          label: getSeriesLabel(key),
+          value: formatTooltipValue(
+            key,
+            currentData[keyIndex + 1]?.[idx] as number | null | undefined,
+            unit,
+          ),
+          color: colors[keyIndex] ?? colors[0],
+        })),
+    });
+    let restoreQueued = false;
+    const restoreMissingDomain = (plot: uPlot) => {
+      const invalid = () =>
+        plot.scales.x.min == null ||
+        plot.scales.x.max == null ||
+        !Number.isFinite(plot.scales.x.min) ||
+        !Number.isFinite(plot.scales.x.max);
+      if (xRange || restoreQueued || !invalid()) return;
+      // uPlot batches draw/size hooks inside its commit. Restore after that
+      // commit so it cannot discard a scale update queued from inside itself.
+      restoreQueued = true;
+      queueMicrotask(() => {
+        restoreQueued = false;
+        if (!plot.root.isConnected || !invalid()) return;
+        const times = plot.data[0],
+          first = times[0],
+          last = times[times.length - 1];
+        if (Number.isFinite(first) && Number.isFinite(last) && last > first)
+          plot.setScale("x", { min: first, max: last });
+      });
+    };
+    return {
+      ...baseOptions,
+      axes: workspace
+        ? baseOptions.axes?.map((axis) => ({
+            ...axis,
+            font: "10px Inter, sans-serif",
+          }))
+        : baseOptions.axes,
+      hooks: {
+        ...baseOptions.hooks,
+        init: [...(baseOptions.hooks?.init ?? []), tooltip.onInit],
+        draw: [restoreMissingDomain],
+        ready: [restoreMissingDomain],
+        setData: [restoreMissingDomain],
+        setSize: [restoreMissingDomain],
+        setCursor: [tooltip.onSetCursor],
+      },
+    };
+  }, [
+    colors,
+    displayTimeZone,
+    keys,
+    baseOptions,
+    rangeHours,
+    unit,
+    workspace,
+    xRange,
+  ]);
+
+  // resize 时只有这个 memo 变，uplot-react 走 setSize() 而非整个 chart 的拆建重建。
+  const chartOptions = useMemo<uPlot.Options>(
+    () =>
+      ({
+        ...enhancedOptions,
+        width: workspace ? measuredWidth : Math.min(width, measuredWidth),
+        height,
+      }) as uPlot.Options,
+    [enhancedOptions, width, measuredWidth, height, workspace],
+  );
+
+  // Hidden tabs measure as zero width; never build a workspace plot before its axes fit.
+  const showPlot = !workspace || (active && measuredWidth > 100);
+  return (
+    <div
+      data-selected={selected}
+      data-metric={title}
+      className="instance-chart-card"
+      style={{ "--chart-accent": colors[0] } as CSSProperties}
+    >
+      <header className="instance-chart-card-head">
+        <div className="instance-panel-subhead">
+          {icon}
+          <span>{title}</span>
+        </div>
+        <div className="instance-series-stats">
+          <span className="tabular">{value}</span>
+          {note && (
+            <span className="tabular text-[var(--text-tertiary)]">{note}</span>
+          )}
+        </div>
+      </header>
+      {workspace && selected && (
+        <aside className="workspace-current-metric">
+          <span className="workspace-current-icon">{icon}</span>
+          <small>当前{title === "CPU" ? "使用率" : title}</small>
+          <strong>{value}</strong>
+          <dl>
+            {(() => {
+              const values = (data[1] as (number | null)[]).filter(
+                (v): v is number => v != null && Number.isFinite(v),
+              );
+              if (!values.length)
+                return (
+                  <div>
+                    <dt>暂无采样</dt>
+                    <dd>—</dd>
+                  </div>
+                );
+              return [
+                ["平均值", values.reduce((a, b) => a + b, 0) / values.length],
+                ["最大值", values.reduce((a, b) => Math.max(a, b), -Infinity)],
+                ["最小值", values.reduce((a, b) => Math.min(a, b), Infinity)],
+              ].map(([label, value]) => (
+                <div key={String(label)}>
+                  <dt>{label}</dt>
+                  <dd>{formatTooltipValue(keys[0], Number(value), unit)}</dd>
+                </div>
+              ));
+            })()}
+          </dl>
+        </aside>
+      )}
+      <div className="instance-uplot-wrap" ref={plotRef}>
+        {showPlot && (
+          <UplotReact
+            key={`${uuid}-${rangeHours}-${xRange?.[0] ?? "auto"}-${xRange?.[1] ?? "auto"}`}
+            options={chartOptions}
+            data={data}
+            resetScales={seedHistoryScales}
+          />
+        )}
+        {tooltip.show && (
+          <div
+            className="instance-chart-tooltip"
+            style={{ left: tooltip.left, top: tooltip.top }}
+          >
+            <div className="instance-chart-tooltip-time">{tooltip.time}</div>
+            {tooltip.rows.map((row) => (
+              <div key={row.label} className="instance-chart-tooltip-row">
+                <span
+                  className="instance-chart-tooltip-dot"
+                  style={{ background: row.color }}
+                />
+                <span>{row.label}</span>
+                <strong>{row.value}</strong>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+export function LoadChart({
+  uuid,
+  hours,
+  range,
+  active = true,
+}: {
+  uuid: string;
+  hours: number;
+  range?: PingTimeRange;
+  active?: boolean;
+}) {
+  const queryHours = hours === 0 ? 1 : hours;
+  const nodeMeta = useNodeMeta(uuid, active);
+  const { data, isLoading, refetch } = useLoadRecords(uuid, queryHours, active, nodeMeta, range);
+  const isRealtime = hours === 0;
+  const node = useNodeMetrics(uuid, isRealtime && active);
+  const { resolvedAppearance, appearance } = usePreferences();
+  const themeSettings = useThemeSettings();
+  const displayTimeZone = themeSettings.displayTimeZone;
+
+  const cupertinoColors = isDarkAppearance(appearance) ? CUPERTINO_DARK_COLORS : CUPERTINO_COLORS;
+  const { w } = useResponsiveChartSize("workspace");
+  const [selectedMetric, setSelectedMetric] = useState(0);
+  const [realtimePoints, setRealtimePoints] = useState<ChartPoint[]>([]);
+  const [connectNulls, setConnectNulls] = useState(false);
+
+  useEffect(() => {
+    if (!active || !isRealtime || !node) return;
+    const point = pointFromNode(node);
+    setRealtimePoints((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && Math.abs(last.time - point.time) < 1) return prev;
+      return [...prev, point].slice(-REALTIME_SAMPLE_LIMIT);
+    });
+  }, [active, isRealtime, node]);
+
+  useEffect(() => {
+    setRealtimePoints([]);
+  }, [hours, range?.end, range?.start, uuid]);
+
+  const chartWindow = useMemo<[number, number] | undefined>(() => {
+    if (!range) return undefined;
+    const start = toChartSeconds(range.start);
+    const end = toChartSeconds(range.end);
+    return start > 0 && end > start ? [start, end] : undefined;
+  }, [range]);
+
+  const historyPoints = useMemo<ChartPoint[]>(() => {
+    const records = [...(data?.records ?? [])];
+    const rawPoints = records
+      .map((record) => ({
+        time: toChartSeconds(record.time),
+        cpu: record.cpu,
+        ram: record.ram_total > 0 ? (record.ram / record.ram_total) * 100 : 0,
+        swap: record.swap_total > 0 ? (record.swap / record.swap_total) * 100 : 0,
+        disk: record.disk_total > 0 ? (record.disk / record.disk_total) * 100 : 0,
+        diskBytes: record.disk,
+        netIn: record.net_in,
+        netOut: record.net_out,
+        connections: record.connections,
+        udp: record.connections_udp,
+        process: record.process,
+        load: record.load,
+      }))
+      .filter((point) => point.time > 0)
+      .sort((a, b) => a.time - b.time);
+    const sampled = downsamplePoints(rawPoints, getHistoryRenderLimit(hours));
+    const filled = fillMissingMetricPoints(sampled);
+    // 共享 helper 现在把缺失格子标成 `number | null | undefined` (ping 路径需要 undefined
+    // 标记 off-phase 列)。LoadChart 只用 null 填充，运行时不会出现 undefined——这里收窄回来。
+    return interpolateMetricGaps(filled, LOAD_INTERPOLATE_KEYS) as ChartPoint[];
+  }, [data, hours]);
+
+  const points = useMemo<ChartPoint[]>(() => {
+    if (isRealtime) {
+      const initial = historyPoints.slice(-REALTIME_HISTORY_SEED_LIMIT);
+      const merged = [...initial, ...realtimePoints].sort((a, b) => a.time - b.time);
+      const deduped = merged.filter((point, index, arr) => {
+        const next = arr[index + 1];
+        return !next || Math.abs(next.time - point.time) >= 1;
+      });
+      return deduped.slice(-REALTIME_SAMPLE_LIMIT);
+    }
+    return historyPoints;
+  }, [historyPoints, isRealtime, realtimePoints]);
+
+  const rangeSummary = range ? "自定义" : formatRangeSummary(hours);
+  const sourceRecordCount = data?.records.length ?? 0;
+  const wasDownsampled = !isRealtime && sourceRecordCount > getHistoryRenderLimit(hours);
+  const sampleSummary = isRealtime
+    ? `${points.length} 个点`
+    : wasDownsampled
+      ? `${points.length} / ${sourceRecordCount} 个点`
+      : `${points.length} 个点`;
+  const coverageSummary = points.length
+    ? `${formatChartCoverageTime(points[0].time, displayTimeZone)} - ${formatChartCoverageTime(points[points.length - 1].time, displayTimeZone)}`
+    : "—";
+
+  if (isLoading) {
+    return <InstanceChartLoading title="负载图表" />;
+  }
+
+  if (!points.length) {
+    return (
+      <InstancePanel title="负载图表">
+        <div className="instance-empty">暂无负载历史数据</div>
+      </InstancePanel>
+    );
+  }
+
+  const chartMetadata = (
+        <div className="instance-chart-headmeta">
+          <div className="instance-chart-meta" aria-label="图表数据范围">
+            <span>
+              覆盖 <strong>{coverageSummary}</strong>
+            </span>
+            <span>
+              采样 <strong>{sampleSummary}</strong>
+            </span>
+          </div>
+          <button
+            type="button"
+            className="instance-toggle-button instance-switch-button"
+            data-active={connectNulls ? "true" : "false"}
+            onClick={() => setConnectNulls((value) => !value)}
+            aria-pressed={connectNulls}
+          >
+            <span className="instance-switch-copy">断点连线</span>
+            <span className="instance-switch-track" aria-hidden>
+              <span className="instance-switch-thumb" />
+            </span>
+            <span className="instance-switch-state">
+              {connectNulls ? "开启" : "关闭"}
+            </span>
+          </button>
+          <button type="button" className="instance-toggle-button" onClick={() => void refetch()}>
+            <RefreshCw size={14} />
+            刷新
+          </button>
+          <span className="instance-chart-range-chip">{rangeSummary}</span>
+        </div>
+  );
+
+  return (
+    <InstancePanel
+      title="负载图表"
+      aside={<details className="cupertino-load-settings"><summary aria-label="图表设置与采样范围">采样设置</summary>{chartMetadata}</details>}
+      className="instance-chart-panel"
+    >
+      <div className="instance-chart-grid">
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 0}
+          icon={<Cpu size={13} />}
+          title="CPU"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? formatMetricPercent(node.cpuPct)
+              : formatMetricPercent(points[points.length - 1]?.cpu ?? 0)
+          }
+          note="使用率"
+          points={points}
+          keys={CPU_KEYS}
+          colors={cupertinoColors.cpu}
+          width={w}
+          height={selectedMetric === 0 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          unit="%"
+          spanGaps={connectNulls}
+          axisKind="percent"
+        />
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 1}
+          icon={<MemoryStick size={13} />}
+          title="内存"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? `${formatBytes(node.ramUsed)} / ${formatBytes(node.ramTotal)}`
+              : data?.records.length
+                ? `${formatBytes(data.records[data.records.length - 1]?.ram ?? 0)} / ${formatBytes(data.records[data.records.length - 1]?.ram_total ?? 0)}`
+                : "—"
+          }
+          note={
+            isRealtime && node
+              ? node.swapTotal
+                ? `Swap ${formatBytes(node.swapUsed)} / ${formatBytes(node.swapTotal)}`
+                : "Swap 无"
+              : data?.records.length && (data.records[data.records.length - 1]?.swap_total ?? 0) > 0
+                ? `Swap ${formatBytes(data.records[data.records.length - 1]?.swap ?? 0)} / ${formatBytes(data.records[data.records.length - 1]?.swap_total ?? 0)}`
+                : "Swap 无"
+          }
+          points={points}
+          keys={MEMORY_KEYS}
+          colors={cupertinoColors.memory}
+          width={w}
+          height={selectedMetric === 1 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          unit="%"
+          spanGaps={connectNulls}
+          axisKind="percent"
+        />
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 2}
+          icon={<HardDrive size={13} />}
+          title="磁盘"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? `${formatBytes(node.diskUsed)} / ${formatBytes(node.diskTotal)}`
+              : data?.records.length
+                ? `${formatBytes(data.records[data.records.length - 1]?.disk ?? 0)} / ${formatBytes(data.records[data.records.length - 1]?.disk_total ?? 0)}`
+                : "—"
+          }
+          note="已用空间"
+          points={points}
+          keys={DISK_KEYS}
+          colors={cupertinoColors.disk}
+          width={w}
+          height={selectedMetric === 2 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          unit="%"
+          spanGaps={connectNulls}
+          axisKind="percent"
+        />
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 3}
+          icon={<Network size={13} />}
+          title="网络"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? `${formatTrafficRateLabel(node.netDown)} / ${formatTrafficRateLabel(node.netUp)}`
+              : data?.records.length
+                ? `${formatTrafficRateLabel(data.records[data.records.length - 1]?.net_in ?? 0)} / ${formatTrafficRateLabel(data.records[data.records.length - 1]?.net_out ?? 0)}`
+                : "—"
+          }
+          note={
+            <span className="instance-overview-multi">
+              <span className="inline-flex items-center gap-1"><ArrowDown size={11} />{isRealtime && node ? formatBytes(node.trafficDown) : data?.records.length ? formatBytes(data.records[data.records.length - 1]?.net_total_down ?? 0) : "—"}</span>
+              <span className="inline-flex items-center gap-1"><ArrowUp size={11} />{isRealtime && node ? formatBytes(node.trafficUp) : data?.records.length ? formatBytes(data.records[data.records.length - 1]?.net_total_up ?? 0) : "—"}</span>
+            </span>
+          }
+          points={points}
+          keys={NETWORK_KEYS}
+          colors={cupertinoColors.network}
+          width={w}
+          height={selectedMetric === 3 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          spanGaps={connectNulls}
+          axisKind="network"
+          axisSize={78}
+        />
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 4}
+          icon={<Workflow size={13} />}
+          title="连接数"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? `TCP ${node.connectionsTcp} / UDP ${node.connectionsUdp}`
+              : data?.records.length
+                ? `TCP ${Math.round(data.records[data.records.length - 1]?.connections ?? 0)} / UDP ${Math.round(data.records[data.records.length - 1]?.connections_udp ?? 0)}`
+                : "—"
+          }
+          note="连接"
+          points={points}
+          keys={CONNECTION_KEYS}
+          colors={cupertinoColors.connections}
+          width={w}
+          height={selectedMetric === 4 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          spanGaps={connectNulls}
+          axisKind="count"
+        />
+        <ChartCard
+          active={active}
+          workspace
+          selected={selectedMetric === 5}
+          icon={<Gauge size={13} />}
+          title="进程"
+          uuid={uuid}
+          value={
+            isRealtime && node
+              ? node.process.toString()
+              : data?.records.length
+                ? Math.round(data.records[data.records.length - 1]?.process ?? 0).toString()
+                : "—"
+          }
+          note={
+            isRealtime && node
+              ? `负载 ${formatLoadValue(node.load1)} | ${formatLoadValue(node.load5)} | ${formatLoadValue(node.load15)}`
+              : data?.records.length
+                ? `负载 ${formatLoadValue(data.records[data.records.length - 1]?.load ?? 0)}`
+                : "—"
+          }
+          points={points}
+          keys={PROCESS_KEYS}
+          colors={cupertinoColors.process}
+          width={w}
+          height={selectedMetric === 5 ? 185 : 105}
+          resolvedAppearance={resolvedAppearance}
+          rangeHours={hours}
+          xRange={chartWindow}
+          displayTimeZone={displayTimeZone}
+          spanGaps={connectNulls}
+          axisKind="count"
+        />
+      </div>
+      {<div className="workspace-metric-tabs" role="group" aria-label="性能指标">{[
+        { label: "CPU", icon: Cpu, value: formatMetricPercent(isRealtime && node ? node.cpuPct : points.at(-1)?.cpu ?? 0) },
+        { label: "内存", icon: MemoryStick, value: isRealtime && node ? `${formatBytes(node.ramUsed)} / ${formatBytes(node.ramTotal)}` : `${formatMetricPercent(points.at(-1)?.ram ?? 0)}` },
+        { label: "磁盘", icon: HardDrive, value: isRealtime && node ? `${formatBytes(node.diskUsed)} / ${formatBytes(node.diskTotal)}` : formatMetricPercent(points.at(-1)?.disk ?? 0) },
+        { label: "网络", icon: Network, value: isRealtime && node ? `↑ ${formatTrafficRateLabel(node.netUp)} · ↓ ${formatTrafficRateLabel(node.netDown)}` : `↓ ${formatTrafficRateLabel(points.at(-1)?.netIn ?? 0)}` },
+        { label: "连接数", icon: Workflow, value: isRealtime && node ? `TCP ${node.connectionsTcp} / UDP ${node.connectionsUdp}` : `${Math.round(points.at(-1)?.connections ?? 0)}` },
+        { label: "进程", icon: Gauge, value: `${Math.round(isRealtime && node ? node.process : points.at(-1)?.process ?? 0)}` },
+      ].map(({ label, icon: Icon, value }, index) => <button key={label} aria-pressed={selectedMetric === index} onClick={() => setSelectedMetric(index)}><span><Icon size={15} />{label}</span><strong>{value}</strong></button>)}</div>}
+    </InstancePanel>
+  );
+}

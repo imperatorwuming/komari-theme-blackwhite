@@ -1,0 +1,524 @@
+import { writeFileSync } from "node:fs";
+
+export async function checkCrystal({ cdp, origin, waitUntil, failGate, setFixture }) {
+  const card = '.crystal-card[data-node="node-0"]';
+  const metric = (width, height = 900, deviceScaleFactor = 1) =>
+    cdp.call("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor, mobile: width < 721 });
+  const exists = selector => `document.querySelector(${JSON.stringify(selector)})!==null`;
+  const waitFor = selector => waitUntil(cdp, exists(selector), 8000);
+  const click = selector => cdp.value(`document.querySelector(${JSON.stringify(selector)}).click()`);
+  const view = mode => `.home-node-results[data-view-mode="${mode}"]`;
+  const selectMode = async mode => {
+    const text = mode === "compact" ? "紧凑" : "标准";
+    await cdp.value(`[...document.querySelectorAll('.cupertino-view-switch button')].find(b=>b.textContent.trim()==='${text}').click()`);
+    await waitFor(view(mode));
+  };
+  const search = value => cdp.value(`(()=>{
+    const input=document.querySelector('.cupertino-home-search input');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(value)});
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  })()`);
+  const cardGeometry = `(()=>{
+    const rect=document.querySelector(${JSON.stringify(card)}).getBoundingClientRect();
+    return [rect.x,rect.width,rect.height].map(value=>Math.round(value*100)/100);
+  })()`;
+  const chooseTheme = async (scheme, label) => {
+    if (!await cdp.value(exists('.floating-controls-trigger[aria-expanded="true"]'))) {
+      await click(".floating-controls-trigger");
+    }
+    const selector = `.floating-controls button[aria-label="晶透 · ${label}"]`;
+    await waitFor(selector);
+    failGate(await cdp.value(`Array.from(document.querySelectorAll('.floating-controls-inner [aria-label="外观选择"] button'))
+      .map(button => button.getAttribute('aria-label')).join('|') === '晶透 · 亮色|晶透 · 暗色'`),
+    'Crystal appearances must be the only options in the floating picker');
+    await click(selector);
+    await waitUntil(cdp, `document.documentElement.dataset.themeStyle==='crystal-${scheme}'`, 6000);
+    await click(".floating-controls-trigger");
+  };
+  const captureCard = async name => {
+    const clip = await cdp.value(`document.fonts.ready.then(()=>{
+      const rect=document.querySelector(${JSON.stringify(card)}).getBoundingClientRect();
+      const y=Math.max(0,Math.floor(rect.top+scrollY-16));
+      const width=Math.min(innerWidth,Math.ceil(rect.right+16));
+      const height=Math.ceil(rect.height+40);
+      const style=document.createElement('style');
+      style.id='crystal-crop';
+      style.textContent='body{min-height:'+(y+height)+'px}.cupertino-home,.cupertino-masthead,.floating-controls,.site-footer{visibility:hidden}';
+      document.head.append(style);
+      return {x:0,y,width,height,scale:1};
+    })`);
+    const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png', clip, captureBeyondViewport: true });
+    writeFileSync(`${process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE}-${name}.png`, Buffer.from(screenshot.data, 'base64'));
+    await cdp.value("document.querySelector('#crystal-crop').remove()");
+  };
+
+  await metric(1086, 1448);
+  await cdp.call("Page.navigate", { url: origin });
+  await waitFor(".app-shell");
+  await cdp.value("localStorage.clear(); sessionStorage.clear()");
+  await cdp.call("Page.reload");
+  await waitUntil(cdp, "document.documentElement.dataset.themeStyle==='crystal-light'", 8000);
+  await waitFor(`${card} .crystal-speed-value:enabled`);
+  await waitFor(`${card} [data-family="6"] a.crystal-quality`);
+  await waitFor(".cupertino-overview .workspace-fleet-line");
+  for (const [scheme, label] of [["light", "亮色"], ["dark", "暗色"]]) {
+    if (scheme === "dark") await chooseTheme(scheme, label);
+    failGate(await cdp.value(`(()=>{
+      const card=document.querySelector(${JSON.stringify(card)});
+      const rows=[...card.querySelectorAll('.crystal-network-row')];
+      const [resources,stats,quota]=[...card.querySelectorAll('.crystal-panel')].map(panel=>panel.getBoundingClientRect());
+      const overview=[...document.querySelectorAll('.cupertino-overview-card')];
+      const panelStyle=getComputedStyle(card.querySelector('.crystal-resources'));
+      const ringStyle=getComputedStyle(document.querySelector('.cupertino-fleet-ring'));
+      return document.documentElement.dataset.appearance===${JSON.stringify(scheme)} &&
+        document.documentElement.dataset.themeStyle==='crystal-${scheme}' &&
+        document.documentElement.style.colorScheme===${JSON.stringify(scheme)} &&
+        document.querySelector('.cupertino-sidebar')===null &&
+        overview.length===4 && overview.every(el=>{
+          const style=getComputedStyle(el);
+          return style.boxShadow===panelStyle.boxShadow && style.backgroundImage===panelStyle.backgroundImage &&
+            style.fontFamily===panelStyle.fontFamily && style.textShadow!=='none';
+        }) &&
+        ringStyle.boxShadow!=='none' && ringStyle.backgroundImage.includes('conic-gradient') &&
+        getComputedStyle(document.querySelector('.workspace-fleet-line')).filter.includes('drop-shadow') &&
+        document.querySelector('.cupertino-home-search input')!==null &&
+        rows.map(row=>row.firstElementChild.textContent).join('|')==='电信|联通|移动|电信 IPv6|联通 IPv6|移动 IPv6' &&
+        Math.abs((rows[0].getBoundingClientRect().top-quota.bottom)-(stats.top-resources.bottom))<.5 &&
+        rows.every(row=>row.children.length===4 && row.querySelectorAll('.crystal-history i').length===18) &&
+        card.querySelector('.crystal-location,.crystal-favorite')===null &&
+        card.querySelector('.crystal-flag img[alt="地区旗帜: US"]') &&
+        getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()===${JSON.stringify(scheme === "light" ? "#edf3fc" : "#0b111c")} &&
+        [...card.querySelectorAll('.crystal-route-label')].every(label=>label.scrollWidth<=label.clientWidth+1) &&
+        ['White','在线 1天22小时','8.3%','30.9%','23.2%','流量消耗','60%','1049','155.86','59.8','107.7'].every(value=>card.textContent.includes(value)) &&
+        card.querySelectorAll('.crystal-quota-track [data-filled="true"]').length===21 &&
+        card.querySelectorAll('.crystal-quota-track i').length===35;
+    })()`), "Crystal overview or reference card is missing shared shadows, spacing, live data, or ordered names");
+    if (process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE) await captureCard(scheme);
+    await click(".cupertino-assets");
+    await waitFor(".cost-summary-sort-tab");
+    failGate(await cdp.value("[...document.querySelectorAll('.cost-summary-sort-tab')].map(tab=>tab.textContent.trim()).join('|')==='到期|剩余|价格|权重'"), "Asset sort controls appear in the wrong order");
+    failGate(await cdp.value("document.querySelector('.cost-summary-sort-tab[aria-pressed=true]').textContent==='到期'"), "Asset summary did not default to expiry");
+    await click('.cost-summary-panel button[aria-label="关闭服务器花费"]');
+  }
+
+  for (const [selector, detail] of [
+    ['.crystal-route-value[data-direction="forward"]:enabled', "电信 IPv4 去程"],
+    ['.crystal-speed-value[data-direction="download"]:enabled', "三网测速 · 北京 · IPv4"],
+  ]) {
+    await click(`${card} ${selector}`);
+    await waitUntil(cdp, `document.querySelector('.network-drawer')?.textContent.includes(${JSON.stringify(detail)})===true`, 6000);
+    await click('.network-drawer button[aria-label="关闭面板"]');
+  }
+  await click(`${card} .dense-node-actions summary`);
+  failGate(await cdp.value(`(()=>{
+    const menu = document.querySelector(${JSON.stringify(`${card} .dense-node-menu`)});
+    return ['节点详情','网络监控','生成报告','复制 IPv4','复制 IPv6'].every(label=>menu.textContent.includes(label));
+  })()`), "Crystal overflow menu lost Dense node actions");
+  await click(`${card} .dense-node-actions summary`);
+
+  setFixture({ nodes: 4, crystalControls: true });
+  await cdp.call("Page.reload");
+  await waitFor(`${card} .crystal-network-controls .crystal-check button`);
+  await click(`${card} .dense-node-actions summary`);
+  await click(`${card} .dense-node-menu button[aria-pressed="false"]`);
+  await click(`${card} .dense-node-actions summary`);
+  await click(".cupertino-status-filters button:last-child");
+  await waitUntil(cdp, "document.querySelectorAll('.crystal-card[data-node]').length===1", 6000);
+  await click(".cupertino-status-filters button:first-child");
+  await waitUntil(cdp, "document.querySelectorAll('.crystal-card[data-node]').length===4", 6000);
+  const routeLabels = `[...document.querySelectorAll(${JSON.stringify(`${card} .crystal-route-value`)})].map(route => route.textContent)`;
+  await waitFor(`${card} .crystal-route-value:enabled`);
+  const initialRoutes = await cdp.value(routeLabels);
+  await cdp.call('Emulation.setFocusEmulationEnabled', { enabled: true });
+  await cdp.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+  await cdp.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+  failGate(await cdp.value(`(() => {
+    const city = document.querySelector(${JSON.stringify(`${card} .crystal-city`)});
+    const select = city.querySelector('select');
+    const border = getComputedStyle(city).borderTopColor;
+    select.focus();
+    const valid = select.matches(':focus-visible') && getComputedStyle(select).outlineStyle === 'none' &&
+      getComputedStyle(city).borderTopColor !== border;
+    select.blur();
+    return valid;
+  })()`), 'Crystal city keyboard focus should use the button border without an outline');
+  await cdp.value(`(()=>{
+    const select=document.querySelector(${JSON.stringify(`${card} .crystal-city select`)});
+    select.value='上海'; select.dispatchEvent(new Event('change',{bubbles:true}));
+  })()`);
+  await waitUntil(cdp, `document.querySelector(${JSON.stringify(`${card} .crystal-speed-value`)}).textContent.trim()==='0.0'`, 6000);
+  failGate(JSON.stringify(await cdp.value(routeLabels)) === JSON.stringify(initialRoutes), "Crystal city switch changed the restored routes");
+  failGate(await cdp.value(`document.querySelectorAll(${JSON.stringify(`${card} .crystal-network-controls .crystal-check button`)}).length===2`), "Crystal card is missing authorized quick checks");
+
+  const layouts = [];
+  for (const [scheme, label] of [["dark", "暗色"], ["light", "亮色"]]) {
+    if (scheme === "light") await chooseTheme(scheme, label);
+    for (const width of [1910, 1440, 768, 390, 320]) {
+      await metric(width);
+      await cdp.value("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+      for (const mode of ["compact", "standard"]) {
+        await selectMode(mode);
+        const geometry = await cdp.value(`(()=>{
+          const card=document.querySelector(${JSON.stringify(card)}), bounds=card.getBoundingClientRect();
+          const cells=[...card.querySelectorAll('.crystal-network-row > *, .crystal-resource-value')];
+          const controls=[...card.querySelectorAll('.crystal-network-controls .crystal-city,.crystal-network-controls .crystal-check > button')].map(el=>el.getBoundingClientRect());
+          const header=[...card.querySelector('.crystal-header').children].map(el=>el.getBoundingClientRect());
+          return {
+            width: innerWidth, card: Math.round(bounds.width),
+            aligned: cells.every(cell=>cell.getBoundingClientRect().right<=bounds.right && cell.scrollWidth<=cell.clientWidth+1),
+            overflow: document.documentElement.scrollWidth>innerWidth,
+            equalControls: controls.length===3 && controls.every(el=>el.height>=26 && Math.abs(el.height-controls[0].height)<.5 && Math.abs(el.y-controls[0].y)<.5),
+            singleHeader: header.length===5 && header.every(el=>Math.abs(el.y+el.height/2-header[0].y-header[0].height/2)<1 && el.right<=bounds.right),
+            standard: card.textContent.includes('最近测速') && !!card.querySelector('.crystal-tags'),
+          };
+        })()`);
+        failGate(geometry.aligned && !geometry.overflow && geometry.equalControls && geometry.singleHeader && geometry.standard === (mode === "standard"),
+          `Crystal ${scheme} ${mode} layout at ${width}px: ${JSON.stringify(geometry)}`);
+        if (width === 1910 || width === 390) {
+          const before = await cdp.value(cardGeometry);
+          await search("White node-0");
+          await waitUntil(cdp, "document.querySelectorAll('.crystal-card[data-node]').length===1", 6000);
+          const after = await cdp.value(cardGeometry);
+          failGate(JSON.stringify(before) === JSON.stringify(after),
+            `Crystal ${scheme} ${mode} card resized at ${width}px after searching: ${before} → ${after}`);
+          await search("");
+          await waitUntil(cdp, "document.querySelectorAll('.crystal-card[data-node]').length===4", 6000);
+        }
+        layouts.push({ scheme, mode, ...geometry });
+      }
+      if (width === 1910 && process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE) {
+        const clip = await cdp.value(`document.fonts.ready.then(()=>{
+          const rect=document.querySelector('.cupertino-overview').getBoundingClientRect();
+          return {x:0,y:Math.floor(rect.top+scrollY-8),width:innerWidth,height:Math.ceil(rect.height+24),scale:1};
+        })`);
+        const screenshot = await cdp.call("Page.captureScreenshot", { format:"png", clip, captureBeyondViewport:true });
+        writeFileSync(`${process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE}-${scheme}-overview.png`, Buffer.from(screenshot.data, "base64"));
+      } else if (width === 390 && process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE) {
+        await cdp.value(`document.querySelector(${JSON.stringify(card)}).scrollIntoView({block:'center'})`);
+        const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+        writeFileSync(`${process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE}-${scheme}-mobile.png`, Buffer.from(screenshot.data, "base64"));
+      }
+    }
+  }
+
+  setFixture({
+    auroraOffline: true,
+    auroraSpeedFamilies: ["6"],
+    auroraRouteFamilies: ["4"],
+    crystalPingBindings: { 1: ["node-0", "node-3"], 2: ["node-3"], 3: ["node-3"], 4: ["node-1"], 7: ["node-1"], 8: ["node-1"], 9: ["node-3"] },
+    crystalPingTaskOrder: { "node-1": [8, 4, 7], "node-3": [9, 3, 1, 2] },
+  });
+  await cdp.call("Page.reload");
+  await waitFor(`${card} .crystal-status[data-online="false"]`);
+  await waitFor(view("standard"));
+  await waitFor(`${card} .crystal-route-value:enabled`);
+  await waitFor('.crystal-card[data-node="node-1"] a[href*="pingTasks=7"]');
+  await waitFor('.crystal-card[data-node="node-1"] [data-family="6"] .crystal-speed-value:enabled');
+  await waitFor('.crystal-card[data-node="node-3"] .crystal-quality');
+  await click(`${card} .dense-node-actions summary`);
+  failGate(await cdp.value(`(()=>{
+    const nodes=[0,1,2,3].map(index=>document.querySelector('.crystal-card[data-node="node-'+index+'"]'));
+    const labels=node=>[...node.querySelectorAll('.crystal-network-name')].map(label=>label.textContent).join('|');
+    const privateRow=nodes[1].querySelector('a[href*="pingTasks=7"]').closest('.crystal-network-row');
+    const longLabel=nodes[3].querySelector('.crystal-network-name');
+    return labels(nodes[0])==='电信' &&
+      labels(nodes[1])==='机房网关|电信 IPv6|内网 IPv4' &&
+      labels(nodes[2])==='' &&
+      labels(nodes[3])==='广州电信·跨境链路-LongProbeName|移动|电信|联通' &&
+      longLabel.title===longLabel.textContent && longLabel.scrollWidth<=longLabel.clientWidth+1 &&
+      nodes[3].querySelectorAll('[data-carrier="电信"][data-family="4"]').length===2 &&
+      nodes[0].querySelector('.dense-node-menu button[aria-pressed="true"]') &&
+      !nodes[0].querySelector('.crystal-speed-value:enabled') &&
+      !nodes[1].querySelector('.crystal-route-value:enabled') &&
+      privateRow.querySelectorAll('[data-tone="empty"]').length===18 &&
+      new URL(privateRow.querySelector('a.crystal-quality').href).searchParams.get('pingTasks')==='7' &&
+      !nodes[1].querySelector('.aurora-extra');
+  })()`), "Crystal cards lost per-node Ping names, ordering, same-carrier tasks, or bindings with no samples");
+  setFixture({ auroraHidden: true });
+  await cdp.call("Page.reload");
+  await waitFor(`${card} a.crystal-quality`);
+  await waitUntil(cdp, `document.querySelectorAll(${JSON.stringify(`${card} .crystal-network-row > *`)}).length===2 &&
+    !document.querySelector(${JSON.stringify(`${card} .crystal-route-pair, ${card} .crystal-speed-pair`)})`, 8000);
+
+  const at = new Date().toISOString();
+  setFixture({ crystalLowMeters: true, homeDiagnostics: {
+    "node-0": {
+      "traffic-reset": { day: 16, elapsed: 5, total: 30, nextAt: Date.now() + 25 * 86400000 },
+      "ip-quality": { "4": { at, state: "ok", providers: {
+        IPinfo: { usage: "isp", company: "isp" }, ipregistry: { usage: "isp", company: "isp" },
+        ipapi: { usage: "isp", company: "business" }, IP2Location: { usage: "hosting", company: "hosting", score: "3" },
+        AbuseIPDB: { usage: "isp" },
+      }, riskScores: { Scamalytics: "63", ipapi: "0.00%", AbuseIPDB: "0" } },
+        "6": { at, state: "partial", ipMode: "lite", dbIpScore: "0", providers: { IPinfo: { usage: "isp" }, ipapi: { score: "3.52%" } } } },
+      "media-unlock": { "4": { at, state: "partial", services: {
+        TikTok: { status: "unlocked", region: "WW", mode: "native" },
+        DisneyPlus: { status: "partial", region: "WW", mode: "dns" },
+        Netflix: { status: "unlocked", region: "US", mode: "dns" },
+        Youtube: { status: "unlocked", region: "HK" },
+        AmazonPrimeVideo: { status: "unlocked", mode: "native" },
+        Reddit: { status: "blocked" },
+        ChatGPT: { status: "unsupported", region: "TW", mode: "dns" },
+      } } },
+    },
+    "node-1": { "ip-quality": { "4": { at, state: "ok", providers: { IPinfo: { company: "isp" } } } } },
+  } });
+  await cdp.call("Page.reload");
+  const reset = `${card} [aria-label="流量周期"]`, ip = `${card} [aria-label="IP能力"]`, unlock = `${ip} [aria-label="解锁"]`;
+  const toggle = `${card} .crystal-network-actions .crystal-ip-toggle`;
+  const toggleChevronTransform = () => cdp.value(
+    `getComputedStyle(document.querySelector(${JSON.stringify(`${toggle} svg[aria-hidden="true"]`)})).transform`);
+  const otherIp = '.crystal-card[data-node="node-1"] .crystal-diagnostic';
+  await waitFor(`${unlock} .crystal-unlock-list`);
+  failGate(await cdp.value(`(() => {
+    const [reset, ip, unlock] = ${JSON.stringify([reset,ip,unlock])}.map(selector => document.querySelector(selector));
+    return reset?.textContent.includes('流量周期 17%') && reset.textContent.includes('已过 5 天 / 剩余 25 天') &&
+      !reset.textContent.includes('30 天周期') && reset.querySelector('small').title.includes('30 天周期') &&
+      reset.querySelectorAll('.crystal-quota-track i').length === 35 &&
+      reset.compareDocumentPosition(ip) & Node.DOCUMENT_POSITION_FOLLOWING &&
+      ip.contains(unlock) && ip.querySelector('h3').textContent==='IP能力' && !unlock.querySelector('h4') &&
+      !ip.querySelector('.crystal-diagnostic-header svg') && ip.querySelectorAll('.crystal-family-tabs').length===1 &&
+      ip.textContent.includes('机房') && ip.querySelector('table tbody').rows.length === 2 &&
+      ip.querySelector('.crystal-risk').textContent.includes('Scamalytics63高风险') &&
+      ip.querySelector('.crystal-risk li:last-child').textContent.includes('0低风险') &&
+      unlock.textContent.includes('屏蔽') && unlock.textContent.includes('DNS') &&
+      !document.querySelector('.crystal-card[data-node="node-2"] .crystal-diagnostic, .crystal-card[data-node="node-2"] .crystal-ip-toggle');
+  })()`), "Crystal homepage lost a per-node reset, IP or unlock observation");
+  await click(`${ip} button:nth-child(2)`);
+  await waitUntil(cdp, `document.querySelector(${JSON.stringify(ip)}).textContent.includes('3.52%')`, 3000);
+  failGate(await cdp.value(`document.querySelector(${JSON.stringify(ip)}).textContent.includes('IPQuality Lite · DB-IP 0 · 低风险')`),
+    "Crystal did not show the measured DB-IP score in Lite mode");
+  await waitUntil(cdp, `document.querySelector(${JSON.stringify(unlock)}).textContent.includes('暂无 IPv6 解锁结果')`, 3000);
+  failGate(await cdp.value(`(() => {
+    const button = document.querySelector(${JSON.stringify(toggle)});
+    const panel = document.querySelector(${JSON.stringify(ip)});
+    return button?.textContent==='IP能力' && button.getAttribute('aria-expanded')==='true' &&
+      button.getAttribute('aria-controls')===panel.id && !panel.hidden &&
+      !button.parentElement.querySelector('.crystal-check');
+  })()`), "Crystal IP capability did not have a standalone control");
+  failGate(await toggleChevronTransform() === "matrix(-1, 0, 0, -1, 0, 0)",
+    "Crystal expanded IP capability arrow does not point up");
+  await click(toggle);
+  await waitFor(`${toggle}[aria-expanded="false"]`);
+  failGate(await toggleChevronTransform() === "none", "Crystal collapsed IP capability arrow does not point down");
+  failGate(await cdp.value(`(() => {
+    const panel = document.querySelector(${JSON.stringify(ip)});
+    const other = document.querySelector(${JSON.stringify(otherIp)});
+    return panel.hidden && !panel.getClientRects().length && other.id !== panel.id && !other.hidden;
+  })()`), "Crystal capability toggle did not collapse only its own card");
+  await click(toggle);
+  await waitFor(`${toggle}[aria-expanded="true"]`);
+  failGate(await cdp.value(exists(`${ip}:not([hidden]) button:nth-child(2)[aria-pressed="true"]`)),
+    "Crystal capability lost its selected address family");
+
+  setFixture({ auroraHidden: false, auroraSpeedFamilies: ["4", "6"] });
+  await metric(390);
+  await cdp.call("Page.reload");
+  await waitFor(`${unlock} .crystal-unlock-list`);
+  await waitFor(`${card} .crystal-check > button`);
+  failGate(await cdp.value(`(() => {
+    const button = document.querySelector(${JSON.stringify(toggle)});
+    const checks = [...button.parentElement.querySelectorAll('.crystal-check > button')];
+    const bounds = button.getBoundingClientRect();
+    return checks.map(check => check.textContent.trim()).join('|')==='检测线路|测速' &&
+      checks.every(check => {
+        const r = check.getBoundingClientRect();
+        return r.right <= bounds.left && Math.abs(r.top - bounds.top) < .5 && Math.abs(r.height - bounds.height) < .5;
+      });
+  })()`), "Crystal IP capability control is not aligned after route and speed actions");
+  for (const scheme of ["crystal-light", "crystal-dark"]) {
+    await cdp.value(`document.documentElement.dataset.themeStyle=${JSON.stringify(scheme)}`);
+    failGate(await cdp.value(`(() => {
+      const panel = document.querySelector(${JSON.stringify(ip)});
+      return getComputedStyle(panel.querySelector('header')).borderBottomWidth === '0px' &&
+        [...panel.querySelectorAll('.crystal-risk, .crystal-capability-unlock')].every(section => getComputedStyle(section).borderTopWidth === '0px');
+    })()`), `Crystal IP capability still draws separators in ${scheme}`);
+    for (const width of [320, 360, 375, 458, 390]) {
+      await metric(width);
+      failGate(await cdp.value(`(() => {
+        const bars = [...document.querySelectorAll(${JSON.stringify(`${card} .crystal-resource-track i`)})];
+        return bars.length===4 && bars.every(bar => {
+          const rect = bar.getBoundingClientRect();
+          return rect.width>=rect.height && getComputedStyle(bar).borderTopLeftRadius==='999px';
+        }) && getComputedStyle(bars[3]).backgroundImage.includes('rgb(0, 135, 114)') &&
+          !document.querySelector('.crystal-card[data-node="node-1"] .crystal-resource-track i');
+      })()`), `Crystal tiny or zero resource meters are incorrect at ${width}px in ${scheme}`);
+      failGate(await cdp.value(`(() => ${JSON.stringify([reset,ip,unlock])}.every(selector => {
+        const panel = document.querySelector(selector);
+        return panel.scrollWidth <= panel.clientWidth + 1;
+      }))()`), `Crystal homepage diagnostics overflow at ${width}px in ${scheme}`);
+      failGate(await cdp.value(`[...document.querySelectorAll(${JSON.stringify(`${unlock} li strong`)})].every(label => {
+        const range = new Range(); range.selectNodeContents(label);
+        const text = range.getBoundingClientRect(), cell = label.closest('li').getBoundingClientRect();
+        return range.getClientRects().length === 1 && text.left >= cell.left && text.right <= cell.right;
+      })`), `Crystal split or clipped an unlock service at ${width}px in ${scheme}`);
+      const diagnostics = await cdp.value(`(() => {
+        const ip = document.querySelector(${JSON.stringify(ip)});
+        const labels = [...ip.querySelectorAll('tbody th, .crystal-risk-heading')].map(el => {
+          const { left, right } = el.getBoundingClientRect();
+          return [left, right];
+        });
+        const business = ip.querySelector('tbody .crystal-diagnostic-badge[data-tone="business"]');
+        const brokenTags = [...ip.querySelectorAll('.crystal-unlock-tags')].flatMap(group => {
+          const badge = group.previousElementSibling.getBoundingClientRect();
+          const chips = [...group.children];
+          const first = chips[0].getBoundingClientRect(), last = chips.at(-1).getBoundingClientRect();
+          const aligned = Math.abs(first.left - badge.left) < .5 && Math.abs(last.right - badge.right) < .5 &&
+            Math.abs(first.width - last.width) < .5 && Math.abs(first.top - last.top) < .5;
+          return aligned && chips.every(chip => chip.scrollWidth <= chip.clientWidth + 1) ? [] : [group.textContent];
+        });
+        const riskStart = ip.querySelector('.crystal-risk-heading').getBoundingClientRect();
+        const riskEnd = ip.querySelector('.crystal-risk-list li:last-child').getBoundingClientRect();
+        const unlocks = [...ip.querySelectorAll('.crystal-unlock-list li')].map(el => el.getBoundingClientRect());
+        const unlockStart = unlocks[0];
+        const unlockEnd = unlocks.findLast(rect => Math.abs(rect.top - unlockStart.top) < .5);
+        const edgesAligned = Math.abs(riskStart.left - unlockStart.left) < .5 && Math.abs(riskEnd.right - unlockEnd.right) < .5;
+        return { labels, edgesAligned, brokenTags, yellow: business?.textContent==='企业' && getComputedStyle(business).backgroundImage.includes('255, 229, 133') };
+      })()`);
+      failGate(diagnostics.yellow && diagnostics.edgesAligned && !diagnostics.brokenTags.length && diagnostics.labels.length === 3 &&
+        diagnostics.labels.every(([left, right]) => Math.abs(left - diagnostics.labels[0][0]) < 1 && Math.abs(right - diagnostics.labels[0][1]) < 1),
+      `Crystal IP capability geometry or color at ${width}px in ${scheme}: ${JSON.stringify(diagnostics)}`);
+    }
+    failGate(await cdp.value(`new Set([...document.querySelectorAll(${JSON.stringify(`${unlock} li`)})].map(cell => cell.offsetTop)).size === 1`),
+      `Crystal did not align seven unlock services in one row at 390px in ${scheme}`);
+    if (process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE) {
+      await click(`${ip} button:first-child`);
+      await cdp.value(`document.querySelector(${JSON.stringify(ip)}).scrollIntoView({block:'center'})`);
+      const screenshot = await cdp.call("Page.captureScreenshot", { format: "png" });
+      writeFileSync(`${process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE}-diagnostics-${scheme}.png`, Buffer.from(screenshot.data, "base64"));
+    }
+  }
+
+  if (process.env.BROWSER_CRYSTAL_SCREENSHOT_BASE) {
+    setFixture({ nodes: 1, auroraOffline: false, crystalLowMeters: false, crystalPingBindings: undefined,
+      crystalPingTaskOrder: undefined, auroraRouteFamilies: ['4', '6'] });
+    await metric(463, 1120, 2);
+    await cdp.call('Page.reload');
+    await waitFor(`${card} .crystal-status[data-online="true"]`);
+    await selectMode('compact');
+    await waitFor(`${unlock} .crystal-unlock-list`);
+    await waitUntil(cdp, `document.querySelectorAll(${JSON.stringify(`${card} .crystal-network-row`)}).length === 6`, 6000);
+    for (const [scheme, label] of [['light', '亮色'], ['dark', '暗色']]) {
+      await chooseTheme(scheme, label);
+      await captureCard(`showcase-${scheme}`);
+    }
+  }
+
+  const longName = 'long-datacenter-node.central-europe.ipv6.tier-3.compute-instance-00001';
+  setFixture({ nodes: 24, crystalLongName: longName });
+  await metric(1440, 900);
+  await cdp.call("Page.reload");
+  await waitFor(".cupertino-assets");
+  await cdp.call("Emulation.setFocusEmulationEnabled", { enabled: true });
+  await cdp.value("(() => { const input = document.querySelector('.cupertino-home-search input'); input.blur(); input.focus(); })()");
+  await waitUntil(cdp, "document.body.textContent.includes('us cn2, de 9929')", 3000);
+  await cdp.value("document.activeElement.blur()");
+  const panelBounds = selector => cdp.value(`(() => {
+    const panel = document.querySelector(${JSON.stringify(selector)});
+    return [panel.offsetLeft, panel.offsetTop, panel.offsetWidth, panel.offsetHeight];
+  })()`);
+  for (const [width, height] of [[1440, 900], [390, 850]]) {
+    await metric(width, height);
+    await click('.cupertino-assets');
+    await waitUntil(cdp, "document.querySelectorAll('.cost-summary-detail-item').length===24", 8000);
+    const longTitle = '.cost-summary-detail-item[data-node-uuid="node-0"] .cost-summary-detail-title[data-overflow="true"]';
+    await waitFor(longTitle);
+    failGate(await cdp.value(`(() => {
+      const title = document.querySelector(${JSON.stringify(longTitle)});
+      const rows = [...document.querySelectorAll('.cost-summary-detail-item')];
+      return title.title === ${JSON.stringify(longName)} && getComputedStyle(title).maskImage.includes('linear-gradient') &&
+        rows.every(row => Math.abs(row.getBoundingClientRect().height - rows[0].getBoundingClientRect().height) < .5 &&
+          row.scrollWidth <= row.clientWidth + 1);
+    })()`), `Asset rows or overflow mask break at ${width}px`);
+    if (width === 1440) {
+      await cdp.value("Promise.all(document.querySelector('.cost-summary-panel.show').getAnimations().map(animation => animation.finished.catch(() => {})))");
+      const point = await cdp.value(`(() => {
+        const title = document.querySelector(${JSON.stringify(longTitle)});
+        title.scrollIntoView({block:'center', behavior:'instant'});
+        const { x, y, width, height } = title.getBoundingClientRect();
+        return { x: x + width / 2, y: y + height / 2 };
+      })()`);
+      await cdp.call('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point });
+      failGate(await cdp.value(`document.querySelector(${JSON.stringify(longTitle)}).matches(':hover')`),
+        `Asset overflow test did not hover the name at ${JSON.stringify(point)}`);
+      await waitUntil(cdp, `(() => {
+        const title = document.querySelector(${JSON.stringify(longTitle)});
+        return title.matches(':hover') && Math.abs(title.firstElementChild.getBoundingClientRect().right - title.getBoundingClientRect().right) < 1;
+      })()`, 12000);
+      await cdp.call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 });
+    }
+    const assetBounds = await panelBounds(".cost-summary-panel.show");
+    for (const kind of ["bandwidth", "traffic"]) {
+      await click(`[data-home-overview-trigger="${kind}"]`);
+      await waitUntil(cdp, "document.querySelectorAll('.home-overview-panel.show .home-overview-row').length===24", 8000);
+      const metricBounds = await panelBounds(".home-overview-panel.show");
+      failGate(JSON.stringify(assetBounds) === JSON.stringify(metricBounds),
+        `Asset and ${kind} panels differ at ${width}px: ${assetBounds} vs ${metricBounds}`);
+    }
+    await click(".home-overview-close");
+  }
+  setFixture({ nodes: 4, crystalLongName: undefined, comprehensive: true });
+  await metric(1440, 900);
+  for (const [view, left, right] of [
+    ['traffic', '.instance-chart-workspace', '.cupertino-system-panel'],
+    ['ping', '.workspace-ping-legend', '.instance-ping-task-groups'],
+  ]) {
+    await cdp.call('Page.navigate', { url: `${origin}/instance/node-0?focus=${view}` });
+    await waitFor(view === 'traffic' ? '.instance-traffic-panel .uplot' : '.instance-ping-panel .uplot');
+    await waitUntil(cdp, `(() => {
+      const a = document.querySelector(${JSON.stringify(left)})?.getBoundingClientRect();
+      const b = document.querySelector(${JSON.stringify(right)})?.getBoundingClientRect();
+      return a && b && b.left > a.left && Math.abs(a.bottom - b.bottom) < .5;
+    })()`, 4000);
+  }
+  setFixture({ comprehensive: false });
+  await metric(1086);
+  await cdp.call("Page.navigate", { url: `${origin}/?view=theme-manage` });
+  await waitFor('.studio-visual-choice input[value="crystal-light"]:checked');
+  await click('.studio-visual-choice input[value="crystal-dark"]');
+  failGate(await cdp.value(exists('.studio-button.is-primary:enabled')), "Crystal default appearance was not editable in Blackwhite Studio");
+  await click(".studio-button.is-primary");
+  await waitUntil(cdp, "document.querySelector('.studio-button.is-primary')?.disabled===true && document.body.textContent.includes('主题设置已保存')", 8000);
+  await cdp.value("localStorage.removeItem('appearance'); localStorage.removeItem('appearance_default')");
+  await cdp.call("Page.navigate", { url: origin });
+  await waitUntil(cdp, "document.documentElement.dataset.themeStyle==='crystal-dark' && localStorage.getItem('appearance_default')===JSON.stringify('crystal-dark')", 8000);
+  await waitFor(card);
+  setFixture({ planCards: true, homeDiagnosticNodes: { "ip-quality": ["node-0"], "media-unlock": ["node-1"] }, homeDiagnosticDisplay: { "ip-quality": false } });
+  await cdp.call("Page.navigate", { url: `${origin}/?view=theme-manage&section=network&panel=traffic-reset` });
+  await waitFor("#network-ip-capability .report-checkbox input:checked");
+  const defaultToggle = '#network-ip-capability .report-checkbox + .report-checkbox input';
+  await waitFor(`${defaultToggle}:checked`);
+  await waitFor('.report-saved-plan[data-selected="false"]');
+  const planColor = await cdp.value("getComputedStyle(document.querySelector('.report-saved-plan[data-selected=false]')).backgroundColor");
+  failGate(planColor === 'rgb(24, 29, 39)', `Saved plan card did not use the Studio dark surface: ${planColor}`);
+  failGate(await cdp.value(`document.querySelectorAll('#network-ip-capability .home-speeds-publish-nodes input:checked').length===2 &&
+    !document.querySelector('#network-ip-quality, #network-media-unlock')`), "Crystal lost the union of separately configured nodes");
+  for (const id of ["network-traffic-reset", "network-ip-capability"]) {
+    const scope = "#" + id;
+    await waitFor(`${scope} .report-checkbox input:checked`);
+    await click(`${scope} .network-actions button:first-child`);
+    failGate(await cdp.value(`[...document.querySelectorAll('${scope} .home-speeds-publish-nodes input')].every(node => node.checked)`), "select all visible nodes was ineffective");
+    await click(`${scope} .report-checkbox input`);
+    await click(`${scope} .network-actions button:last-child`);
+    await waitUntil(cdp, `document.querySelector('${scope} [role=status]')?.textContent.includes('已保存')`, 3000);
+  }
+  await cdp.call("Page.reload");
+  await waitFor("#network-traffic-reset .report-checkbox input:not(:checked)");
+  await waitFor("#network-ip-capability .report-checkbox:first-of-type input:not(:checked)");
+  await click(defaultToggle);
+  const saveCapability = '#network-ip-capability .network-actions button:last-child';
+  await waitFor(`${saveCapability}:enabled`);
+  await click(saveCapability);
+  await waitUntil(cdp, "document.querySelector('#network-ip-capability [role=status]')?.textContent.includes('已保存')", 3000);
+  await cdp.call('Page.reload');
+  await waitFor(`${defaultToggle}:not(:checked)`);
+  await click('#network-ip-capability .report-checkbox:first-of-type input');
+  await click(saveCapability);
+  await waitUntil(cdp, "document.querySelector('#network-ip-capability [role=status]')?.textContent.includes('已保存')", 3000);
+  await cdp.call('Page.navigate', { url: origin });
+  await waitFor(`${toggle}[aria-expanded="false"]`);
+  await waitFor(`${otherIp}[hidden]`);
+  await click(toggle);
+  await waitFor(`${ip}:not([hidden])`);
+  failGate(await cdp.value(exists(`${otherIp}[hidden]`)), 'Opening one Crystal panel changed another card’s default');
+  return { crystal: "light and dark palettes, fixed card width, per-node Ping bindings, city-independent routes, round meters and unified IP capability", layouts };
+}

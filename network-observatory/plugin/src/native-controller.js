@@ -1002,6 +1002,7 @@ function registerNativeController(ctx) {
         }),
       );
       await roundController.publicTick();
+      await roundController.syncDefaultPings();
     } catch (e) {
       console.error("Blackwhite native scheduler:", String(e.message || e));
     } finally {
@@ -1012,6 +1013,17 @@ function registerNativeController(ctx) {
     ctx,
     { read, lock, save, finish, finishMany, pendingJobsFor, isRoundActive, touchJob, coverage, online, tick, catalogTick },
   );
+  route("GET", "/workers/node/:id/default-plans", false, (req, res, s) => {
+    const worker = auth(req, res, s);
+    if (worker) respond(res, 200, roundController.defaultSetup(s, worker.id));
+  });
+  route("POST", "/workers/node/:id/default-plans", false, (req, res, s) => {
+    const worker = auth(req, res, s);
+    if (!worker) return;
+    const selection = readBody(req);
+    if (!selection || typeof selection !== "object") throw new Error("默认观测选项无效");
+    respond(res, 200, roundController.defaultSetup(s, worker.id, selection));
+  });
   void tick();
   return { tick, read, lock, roundController };
 }

@@ -577,14 +577,22 @@ def measure(options, native, fetch=request):
     server, session = None, None
     deadline = time.monotonic() + MEASUREMENT_TIMEOUT
     control = ControlClient(fetch, native, deadline)
-    budget = Budget(maximum * 1048576)
+    split = options.get("splitSpeedBudget") is True
+    limit = maximum * 1048576
+    budgets = [Budget(limit // 2), Budget(limit // 2)] if split else [Budget(limit)]
+    by_direction = {"download": budgets[0], "upload": budgets[-1]}
     def session_fetch(url, method="GET"):
         return control.call(url, method, "session" if method == "GET" else "session-cleanup")
 
     def attempt(direction, count):
         if native.cancelled() or time.monotonic() >= deadline:
             raise ControlFailure("测量已取消或达到总时限", "cancelled")
-        return transfer_phase(server, session, direction, count, seconds, warmup, budget, native, deadline_limit=deadline)
+        run = transfer_phase(server, session, direction, count, seconds, warmup, by_direction[direction], native, deadline_limit=deadline)
+        if split and run["state"] in {"ok", "partial"} and run["seconds"] < 0.5:
+            run.update(state="missing", bitsPerSecond=None, bytes=None, intervals=[],
+                       maxBitsPerSecond=None, medianBitsPerSecond=None,
+                       diagnostic="有效采样不足 0.5 秒；未生成可比较的速率")
+        return run
 
     def attempt_summary(run):
         return {key: run.get(key) for key in ("state", "failureStage", "diagnostic", "trafficBytesObserved", "seconds")}
@@ -615,7 +623,7 @@ def measure(options, native, fetch=request):
             for direction in ("download", "upload"):
                 if native.cancelled():
                     break
-                if budget.remaining <= 0:
+                if by_direction[direction].remaining <= 0:
                     result["runs"].append({"direction": "target-to-source" if direction == "download" else "source-to-target", "vpsDirection": direction,
                                            "streams": count, "state": "missing", "intervals": [], "diagnostic": "已达到此测量点应用载荷上限；未再建立连接"})
                     continue
@@ -626,7 +634,7 @@ def measure(options, native, fetch=request):
         for index, run in enumerate(result["runs"]):
             if native.cancelled() or time.monotonic() + 3 >= deadline:
                 break
-            if run.get("state") != "failed" or not run.get("retryable") or run.get("trafficBytesObserved", 0) or budget.remaining <= 0:
+            if run.get("state") != "failed" or not run.get("retryable") or run.get("trafficBytesObserved", 0) or by_direction[run["vpsDirection"]].remaining <= 0:
                 continue
             pause(2, native, deadline)
             retry = attempt(run["vpsDirection"], run["streams"])
@@ -635,11 +643,11 @@ def measure(options, native, fetch=request):
         result["state"] = "ok" if result["runs"] and all(r["state"] == "ok" for r in result["runs"]) else "partial" if any(r["state"] in {"ok", "partial"} for r in result["runs"]) else "failed"
         result["failureStage"] = next((r.get("failureStage", "transfer") for r in result["runs"] if r.get("state") == "failed"), "")
         result["diagnostic"] = "；".join(f"{r.get('vpsDirection', '')} P{r.get('streams', 1)} / {r.get('failureStage') or 'transfer'}：{r['diagnostic']}" for r in result["runs"] if r.get("diagnostic"))[:700]
-        result["retryable"] = result["state"] == "failed" and budget.used == 0 and any(r.get("retryable") for r in result["runs"])
+        result["retryable"] = result["state"] == "failed" and not any(budget.used for budget in budgets) and any(r.get("retryable") for r in result["runs"])
     except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
         result["diagnostic"] = str(error)[:500]
         result["failureStage"] = getattr(error, "stage", "measurement")
-        result["retryable"] = transient(error) and budget.used == 0 and not native.cancelled()
+        result["retryable"] = transient(error) and not any(budget.used for budget in budgets) and not native.cancelled()
         if any(r.get("state") in {"ok", "partial"} for r in result["runs"]):
             result["state"] = "partial"
     finally:
@@ -650,6 +658,6 @@ def measure(options, native, fetch=request):
                 result["cleanup"] = "会话释放请求失败，等待服务端过期"
         result["controlRequests"] = control.events[-16:]
         result["directoryCacheHits"] = control.cache_hits
-        result["trafficBytesObserved"] = budget.used
-        result["remainingTrafficBytes"] = budget.remaining
+        result["trafficBytesObserved"] = sum(budget.used for budget in budgets)
+        result["remainingTrafficBytes"] = sum(budget.remaining for budget in budgets)
     return result

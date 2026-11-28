@@ -1,6 +1,6 @@
 # Blackwhite 网络观测安装与配置
 
-适用于 **komari-theme-blackwhite 1.0.0、Blackwhite 网络观测插件 1.0.0 和 Blackwhite 探测器 1.0.0**。开始前请先[安装主题并接入 Komari Agent](../README.md#安装主题)。插件依赖支持 JavaScript 插件的 Komari，建议使用通过本项目验证的官方 1.5.1。
+适用于 **komari-theme-blackwhite 1.1.0、Blackwhite 网络观测插件 1.1.0 和 Blackwhite 探测器 1.1.0**。开始前请先[安装主题并接入 Komari Agent](../README.md#安装主题)。插件依赖支持 JavaScript 插件的 Komari，建议使用通过本项目验证的官方 1.5.1。
 
 | 部署位置 | 组件与职责 |
 | --- | --- |
@@ -12,18 +12,18 @@
 
 ## 1. 安装面板插件
 
-1. 在 [Release v1.0.0](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) 的 Assets 下载 **`Blackwhite-Network-Observatory-v1.0.0.zip`**。也可以下载同名 `.sha256`，在两份文件同一目录用 `sha256sum -c Blackwhite-Network-Observatory-v1.0.0.zip.sha256` 核验。
+1. 在 [Release v1.1.0](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) 的 Assets 下载 **`Blackwhite-Network-Observatory-v1.1.0.zip`**。也可以下载同名 `.sha256`，在两份文件同一目录用 `sha256sum -c Blackwhite-Network-Observatory-v1.1.0.zip.sha256` 核验。
 2. 登录 Komari 管理后台，进入 **插件 → 插件管理**，上传完整 ZIP。安装后打开插件的启用开关，检查权限内容并授权。
 3. 插件声明 Node 兼容运行环境、自定义 API 路由及系统 RPC 权限，其中系统 RPC 用于读取节点清单与管理员信息，检测由独立探测器本地执行。启用后确认插件状态为运行中，再回到主题的 **Blackwhite 工作室 → 网络观测**。
 4. 正式面板应使用探测器能够访问且证书有效的 **HTTPS** 地址。若使用反向代理，将面板页面和 `/api/blackwhite-network-observatory/` 一并转发到 Komari。确保 VPS 能访问该面板、GitHub 发布页与所选检测目标。
 
-![Komari 后台插件管理与 Blackwhite 网络观测 1.0.0](../docs/images/install-plugin.jpg)
+![Komari 后台插件管理与 Blackwhite 网络观测](../docs/images/install-plugin.jpg)
 
 ## 2. 在 VPS 安装探测器
 
 1. 打开 **网络观测 → 探测器与测量点**。在「VPS 探测器」选择与当前 VPS 对应的节点。新节点显示「未接入」。选择安装模式（自动、轻量或完整），再点「生成 VPS 接入凭证」。
 2. 复制安装命令。SSH 登录该 VPS，在普通用户的 shell 粘贴并执行；命令使用 `sudo`，需要管理员权限。若在 Alpine 以 root 登录，将命令中的 `sudo` 去掉。脚本会从发布页下载包并核验 SHA-256。
-3. 按提示输入节点专属探测器密钥。终端输入密钥时不回显。**保存好密钥并避免把它写入命令、日志、截图或工单。** 它不同于 Komari Agent 的节点 Token。首次安装后等待一个心跳周期，回到此页确认「在线」、版本 `1.0.0` 和所需能力。
+3. 按提示输入节点专属探测器密钥。终端输入密钥时不回显。**保存好密钥并避免把它写入命令、日志、截图或工单。** 它不同于 Komari Agent 的节点 Token。首次安装后等待一个心跳周期，回到此页确认「在线」、版本 `1.1.0` 和所需能力。
 4. 推荐检查本机服务，并保留完整安装输出方便排障：
 
 ```sh
@@ -64,7 +64,26 @@ sudo sh Blackwhite-Network-Observatory-install.sh \
 
 ![探测器的升级、版本与自动更新选项](../docs/images/probe.jpg)
 
-## 3. 配置首页 Ping 和三网显示
+## 3. 安装时选择默认检测
+
+使用 1.1.0 插件和探测器时，在 Linux 交互终端完成凭证登记后，向导会询问是否为当前 VPS 加入默认方案。加入和立即分批首测可按 Enter 同意。向导分别验证 IPv4、IPv6 的出站连接，只为通过检查的地址族加入方案。
+
+| 默认方案 | 执行时间（北京时间） |
+| --- | --- |
+| 大陆线路 v4／v6 | 每隔 6 小时。回程由 VPS 发起，去程取决于公共测量点和 VPS 公网可达性 |
+| 北京、上海、广州三网 v4／v6 TCPing | 由 Komari Agent 按目标间隔持续采样。卡片显示 TCP 建连延迟和失败率 |
+| IP 质量和流媒体／AI 解锁 | 周三夜间结束，即周四 00:00。结果按实际出口及地址族记录 |
+| 大陆单连接测速 v4／v6 | 每周三 22:00。需单独确认，默认关闭。双栈 VPS 可只启用其中一个地址族 |
+
+测速对每个地址族的京沪穗三网端点每点最多使用 32 MiB 应用载荷，上传和下载各占一半。每个地址族每轮最多 288 MiB，协议开销另计。确认立即执行后，首轮会包含已同意的测速。安装无需等待测试完成，结果随任务结束陆续显示。第三方缺少匹配的城市、运营商或地址族，或有效测速样本过短时，卡片显示缺测。
+
+同一站点复用默认方案及 TCPing 任务。管理员可直接在卡片查看可用结果。访客是否可见由各类摘要的发布范围决定。已升级的 VPS 如需加入，可运行下列命令重新打开探测器配置向导，回车保留已有凭证。
+
+```bash
+sudo python3 /usr/local/libexec/blackwhite-network-observatory/agent.py configure
+```
+
+### 手工配置首页 Ping 和三网显示
 
 1. 在 **Komari 后台 → 运维 → 延迟监测** 新建 Ping 任务。给任务起清楚的名字（例如「上海电信 IPv4」），按后台可用的选项填写地址、检测类型和间隔，选择发起检测的服务器。确保这些目标允许被监测。
 2. 返回 **Blackwhite 工作室 → 网络观测 → 主页延迟检测**。可逐台绑定任务，也可搜索并批量选择 VPS，追加或替换其任务。按需调整对应节点的任务顺序、展示分组和汇总策略。选择「指定主任务」时，还要为目标 VPS 指定一条已绑定的任务。

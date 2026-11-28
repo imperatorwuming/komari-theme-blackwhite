@@ -82,6 +82,7 @@ export const moduleSchema = z.object({
   checks: z.array(z.enum(["hardware_quality", "ip_quality", "net_quality", "backroute_trace"])).optional(),
   timeoutMinutes: z.number().optional(),
   maxTrafficMiB: z.number().optional(),
+  splitSpeedBudget: z.boolean().optional(),
   seconds: z.number(),
   warmupSeconds: z.number(),
   streams: z.array(z.number()),

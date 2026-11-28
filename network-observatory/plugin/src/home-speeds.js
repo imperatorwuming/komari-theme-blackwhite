@@ -19,6 +19,7 @@ function projectRound(round) {
   return {
     reportId: round.id, plannedAt: round.plannedAt, at: round.completedAt,
     family: round.parameters.family, state: round.state,
+    ...(round.parameters.timing?.rules?.some(rule => rule.type === "weekly") ? { weekly: true } : {}),
     cities: CITIES.map(city => ({ city, rows: CARRIERS.map(carrier => {
       // The report planner chooses one canonical resource per city/operator.
       const slot = round.slots.find(s => s.source?.city === city && s.source?.carrier === carrier);
@@ -62,7 +63,7 @@ function homeSpeedStore(root, isMissingFile, clock = () => Date.now()) {
     const nodes = {};
     for (const uuid of allowed) {
       const families = unpack(file(uuid).read());
-      const stamp = value => value ? { ...value, stale: clock() - Date.parse(value.at) > 86400000 } : null;
+      const stamp = value => value ? { ...value, stale: clock() - Date.parse(value.at) > (value.weekly ? 7 : 1) * 86400000 } : null;
       if (!families["4"] && !families["6"]) continue;
       if (splitFamilies) nodes[uuid] = { "4": stamp(families["4"]), "6": stamp(families["6"]) };
       else nodes[uuid] = stamp(Object.values(families).filter(Boolean).sort((a,b) => key(b).localeCompare(key(a)))[0]);

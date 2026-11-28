@@ -10,7 +10,7 @@ const G = require("../src/globalping.js");
 const A = "c388e74d-a922-4ae1-bd10-1fb30e2e53de",
   B = "59d6e276-1d4b-4657-9021-908460853ba3",
   token = "a".repeat(64);
-async function fixture(existingRoot, clients = [A], reportAssetOptions, publicClients) {
+async function fixture(existingRoot, clients = [A], reportAssetOptions, publicClients, rpc) {
   const root =
       existingRoot ||
       fs.mkdtempSync(path.join(os.tmpdir(), "blackwhite-report-api-")),
@@ -19,7 +19,9 @@ async function fixture(existingRoot, clients = [A], reportAssetOptions, publicCl
     reportAssetOptions,
     server: {
       route: (m, p, f) => routes.set(m + " " + p, f),
-      call: async () => clients.map(uuid => ({ uuid, name: "VPS", ipv4: "8.8.8.8", hidden: publicClients && !publicClients.includes(uuid) })),
+      call: async (method, params) => method === "admin:listClients"
+        ? clients.map(uuid => ({ uuid, name: "VPS", ipv4: "8.8.8.8", hidden: publicClients && !publicClients.includes(uuid) }))
+        : rpc?.(method, params),
     },
     storageDir: root,
     isMissingFile: (e) => e.code === "ENOENT",
@@ -92,6 +94,68 @@ const draft = () => ({
   clients: [A],
   revision: 0,
   modules: [{ module: "international", endpoints: ["aws:ap-east-1"] }],
+});
+test("default onboarding shares suites and native TCPing while honoring address-family and first-run choices", async () => {
+  const pings = [];
+  const rpc = (method, params) => {
+    if (method === "admin:getAllPingTasks") return pings;
+    if (method === "admin:addPingTask") {
+      const id = pings.length + 1;
+      pings.push({ ...params, id });
+      return { task_id: id };
+    }
+    assert.equal(method, "admin:editPingTask");
+    for (const task of params.tasks) pings[task.id - 1] = task;
+  };
+  const f = await fixture(undefined, [A, B], undefined, [A], rpc);
+  const url = uuid => `${v2}/workers/node/${uuid}/default-plans`;
+  const add = (uuid, selection) => f.invoke("POST", url(uuid), selection, false, true);
+  try {
+    const clock = require("../src/native-model.js");
+    const request = { families: ["4", "6"], speedFamilies: ["6"], runNow: true };
+    assert.equal((await f.invoke("POST", url(A), request, false)).status, 401);
+    assert.equal((await add(A, { ...request, families: ["4"] })).status, 400);
+    assert.equal((await add(A, request)).body.speedMiBPerFamily, 288);
+    await f.c.roundController.syncDefaultPings();
+    assert.equal((await add(B, { families: ["4"], speedFamilies: [], runNow: false })).status, 200);
+    assert.equal((await add(A, request)).status, 200);
+    await f.c.roundController.syncDefaultPings();
+    const s = f.c.read();
+    assert.equal(s.reportSuites.length, 5);
+    assert.deepEqual(s.reportSuites.find(suite => suite.name.startsWith("大陆线路-v4")).clients, [A, B]);
+    assert.equal(s.reportSuites.find(suite => suite.name.startsWith("大陆线路-v6")).modules[0].timing.minutes, 360);
+    const speed = s.reportSuites.find(suite => suite.name.startsWith("测速")).modules[0];
+    assert.equal(speed.family, "6");
+    assert.equal(speed.maxTrafficMiB, 32);
+    assert.equal(speed.endpoints.length, 9);
+    assert.equal(speed.streams.length, 1);
+    const beforeWednesday = Date.parse("2026-12-02T13:00:00Z");
+    assert.equal(new Date(clock.next(speed.timing, beforeWednesday)).toISOString(), "2026-12-02T14:00:00.000Z");
+    for (const mod of s.reportSuites.find(suite => suite.name.startsWith("IP 质量")).modules)
+      assert.equal(new Date(clock.next(mod.timing, beforeWednesday)).toISOString(), "2026-12-02T16:00:00.000Z");
+    assert.equal(pings.length, 18);
+    assert.equal(pings.filter(ping => ping.clients.includes(B)).length, 9);
+    assert.ok(pings.every(ping => ping.type === "tcp" && ping.target.endsWith(":443") && !ping.default_on));
+    const home = (await f.invoke("GET", v3 + "/home-routes")).body;
+    assert.ok(Object.values(home.pingBindings).every(clients => clients.includes(A)));
+    assert.ok(home.diagnostics[A]["ip-quality"]);
+    assert.deepEqual((await f.invoke("GET", v3 + "/public/routes", {}, false)).body.pingBindings, {});
+    await f.invoke("POST", `${v2}/workers/node/${A}/heartbeat`, {
+      features: ["report-v3", "full-mtr", "public-speed", "ip-quality", "media-unlock"],
+    }, false, true);
+    await f.c.lock(() => {
+      const current = f.c.read();
+      f.c.roundController.tick(current);
+      assert.equal(current.reportDispatch.length, 7);
+      assert.ok(current.reportDispatch.every(batch => batch.nodes.length === 1 && batch.nodes[0] === A));
+      f.c.roundController.tick(current);
+      assert.equal(current.reportDispatch.length, 7);
+      assert.ok(f.c.roundController.dispatchStep(current, { maxSteps: 7, maxMs: 1000 }));
+      assert.equal(current.reportDispatch.length, 0);
+      for (const operation of ["ip-quality", "media-unlock"])
+        assert.deepEqual(current.jobs.filter(job => job.operation === operation).map(job => job.options.family).sort(), ["4", "6"]);
+    });
+  } finally { f.close(); }
 });
 test("installed version and IP diagnostics readiness are independent", async () => {
   const f = await fixture();

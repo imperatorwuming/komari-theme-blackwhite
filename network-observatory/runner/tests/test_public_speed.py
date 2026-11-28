@@ -71,6 +71,24 @@ class PublicSpeedTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 speed.measure({"city": "北京", "carrier": "电信", "family": "4", "streams": streams}, native)
 
+    def test_default_small_budget_reserves_both_directions_and_discards_subsecond_bursts(self):
+        sizes = {}
+        def phase(server, session, direction, streams, seconds, warmup, budget, runtime, deadline_limit):
+            self.assertEqual(budget.remaining, 16 * 1048576)
+            sizes[direction] = budget.reserve(32 * 1048576)
+            budget.account(sizes[direction], sizes[direction])
+            return {"state": "partial", "streams": streams, "vpsDirection": direction,
+                    "seconds": 0.15 if direction == "upload" else 1.0,
+                    "bitsPerSecond": 50_000_000, "trafficBytesObserved": sizes[direction]}
+        with patch.object(speed, "discover", return_value=[{"ip": "8.8.8.8", "port": 8080}]), patch.object(speed, "open_session", return_value="key"), patch.object(speed, "transfer_phase", side_effect=phase):
+            result = speed.measure({"city": "北京", "carrier": "电信", "family": "4",
+                "splitSpeedBudget": True, "maxTrafficMiB": 32}, native, lambda *args: "")
+        self.assertEqual(sizes, {"download": 16 * 1048576, "upload": 16 * 1048576})
+        self.assertEqual(result["trafficBytesObserved"], 32 * 1048576)
+        self.assertEqual(result["runs"][0]["bitsPerSecond"], 50_000_000)
+        self.assertEqual(result["runs"][1]["state"], "missing")
+        self.assertIsNone(result["runs"][1]["bitsPerSecond"])
+
     def test_local_http_transfer_has_a_real_payload_budget_and_does_not_claim_remote_sender_retransmits(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):

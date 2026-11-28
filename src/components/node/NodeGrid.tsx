@@ -29,7 +29,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { useAllNodeMeta, useHomeNodeSummaries } from "@/hooks/useNode";
-import { useHomepagePingOverview, usePingMiniMap } from "@/hooks/usePingMini";
+import { useEffectiveHomepagePingBindings, useHomepagePingOverview, usePingMiniMap } from "@/hooks/usePingMini";
 import { useThemeSettings } from "@/hooks/useThemeSettings";
 import { useViewMode } from "@/hooks/useViewMode";
 import { getAdminClients, getComparisonLoadRecords } from "@/services/api";
@@ -845,6 +845,7 @@ export function NodeGrid() {
   const [trafficClock, setTrafficClock] = useState(() => Date.now());
   const seededHomeViewRef = useRef(false);
   useHomepagePingOverview();
+  const effectivePingBindings = useEffectiveHomepagePingBindings();
   const adminClientsQuery = useQuery({
     queryKey: ["admin-clients"],
     queryFn: getAdminClients,
@@ -914,9 +915,9 @@ export function NodeGrid() {
   const selectedPingTaskByClient = useMemo(
     () =>
       themeSettings.isReady
-        ? invertHomepagePingTaskBindings(themeSettings.homepagePingBindings)
+        ? invertHomepagePingTaskBindings(effectivePingBindings)
         : new Map<string, number>(),
-    [themeSettings.homepagePingBindings, themeSettings.isReady],
+    [effectivePingBindings, themeSettings.isReady],
   );
   const workbenchNodesByUuid = useMemo(() => {
     const next = new Map<string, VpsWorkbenchNode>();

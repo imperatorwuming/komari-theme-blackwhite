@@ -34,7 +34,7 @@ CONFIG_PATH = Path("/etc/blackwhite-network-observatory/agent.json")
 SERVICE_NAME = "blackwhite-network-observatory-agent.service"
 SERVICE_DIR = Path("/usr/local/libexec/blackwhite-network-observatory")
 INIT_DIR = Path("/etc/init.d")
-RUNNER_VERSION = "1.0.0"
+RUNNER_VERSION = "1.1.0"
 RUN_INSTANCE = uuid.uuid4().hex
 POLL_SECONDS = 15
 REQUEST_TIMEOUT = 25
@@ -312,6 +312,62 @@ def worker_capacity():
     return 1 if marker.exists() and marker.read_text().strip() == "lite" else 4
 
 
+def outbound_family(family):
+    for url in ("https://www.cloudflare.com/cdn-cgi/trace", "https://www.google.com/generate_204"):
+        result = subprocess.run(
+            ["curl", "-q", f"-{family}", "--noproxy", "*", "--head", "--silent",
+             "--connect-timeout", "3", "--max-time", "5", url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def setup_choice(prompt, choices, default):
+    while True:
+        value = input(prompt).strip().lower() or default
+        if value in choices:
+            return value
+        print("请选择提示中列出的选项。")
+
+
+def configure_default_plans(config):
+    try:
+        status = api_request(config, "default-plans")
+        if status.get("enrolled"):
+            print("此 VPS 已加入 Blackwhite 默认检测方案。")
+            return
+        budget = status.get("speedMiBPerFamily")
+        if type(budget) is not int or budget <= 0:
+            raise ValueError("当前插件没有提供默认检测方案")
+        print("默认方案会进行大陆线路、原生 TCPing、IP 质量和流媒体／AI 解锁检测，部分结果依赖第三方服务。")
+        if setup_choice("为这台 VPS 加入默认检测方案？[Y/n] ", ("y", "n"), "y") == "n":
+            return
+        print("正在按 IPv4 和 IPv6 分别检查实际出站连通性…")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            families = [family for family, available in zip(("4", "6"), pool.map(outbound_family, ("4", "6"))) if available]
+        if not families:
+            print("暂未验证 IPv4 或 IPv6 出站连通性，探测器已运行，可恢复网络后重新执行配置向导。")
+            return
+        print("已验证 " + "、".join("IPv" + family for family in families) + "。")
+        print(f"测速每个地址族每轮最多 {budget} MiB 应用载荷，协议开销另计。")
+        options = ("n", "y", *families) if len(families) == 2 else ("n", "y")
+        label = "/".join("IPv" + family for family in families)
+        hints = "[y/N/4/6，4 或 6 仅启用对应地址族]" if len(families) == 2 else "[y/N]"
+        speed = setup_choice(f"启用 {label} 的每周测速？{hints} ", options, "n")
+        speed_families = families if speed == "y" else [speed] if speed != "n" else []
+        run_now = setup_choice("安装后立即分批执行首轮（包括已同意的测速）？[Y/n] ", ("y", "n"), "y") == "y"
+        api_request(config, "default-plans", method="POST", body={
+            "families": families, "speedFamilies": speed_families, "runNow": run_now,
+        })
+        print("默认方案已保存，正在配置 TCPing。" + ("首轮由面板后台分批执行。" if run_now else "其余检测会按计划运行。"))
+    except (EOFError, KeyboardInterrupt):
+        print("\n已退出默认检测配置，探测器服务已启动。")
+    except (OSError, ValueError) as error:
+        print(f"默认检测配置暂未完成，探测器已启动。可更新面板插件后重试配置向导：{error}", file=sys.stderr)
+
+
 def configure(server_url="", node_uuid="", probe_id=""):
 
     if os.geteuid() != 0:
@@ -353,6 +409,8 @@ def configure(server_url="", node_uuid="", probe_id=""):
     os.replace(temporary_path, config_target)
     service_name = enable_service(probe_id)
     print(f"已登记节点 {node_uuid} 并启动 {service_name}。")
+    if role == "node" and sys.stdin.isatty():
+        configure_default_plans(config)
 
 
 def native_task(config, task, listeners):

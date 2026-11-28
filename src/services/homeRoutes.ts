@@ -29,6 +29,7 @@ export const homeRoutesSchema = z.object({
   quickFamilies: z.record(z.string(), z.array(z.enum(["4", "6"]))).default({}),
   access: z.enum(["admin", "public"]).default("public"),
   published: z.array(z.string()).default([]),
+  pingBindings: z.record(z.string(), z.array(z.string())).optional(),
   display: z.boolean().default(true),
   labelMode: z.enum(["preferred", "full"]).default("preferred"),
   showDetails: z.boolean().default(false),

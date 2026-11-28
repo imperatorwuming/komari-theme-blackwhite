@@ -25,6 +25,26 @@ class AgentValidationTests(unittest.TestCase):
     def tearDown(self):
         AGENT.close_outbox_scans()
 
+    def test_default_setup_uses_working_families_and_requires_speed_confirmation(self):
+        config = {"nodeUuid": TASK["taskId"]}
+        for answers, available, expected in [
+            (["", "", ""], ["4"], {"families": ["4"], "speedFamilies": [], "runNow": True}),
+            (["", "6", "n"], ["4", "6"], {"families": ["4", "6"], "speedFamilies": ["6"], "runNow": False}),
+        ]:
+            with self.subTest(answers=answers), patch.object(AGENT, "api_request", return_value={"speedMiBPerFamily": 288}) as api, patch.object(AGENT, "outbound_family", side_effect=lambda family: family in available), patch("builtins.input", side_effect=answers), patch("builtins.print"):
+                AGENT.configure_default_plans(config)
+                api.assert_has_calls([
+                    call(config, "default-plans"),
+                    call(config, "default-plans", method="POST", body=expected),
+                ])
+
+    def test_default_setup_can_be_declined_or_reopened_without_reenrolling(self):
+        for status in ({"speedMiBPerFamily": 288}, {"enrolled": True}):
+            with self.subTest(status=status), patch.object(AGENT, "api_request", return_value=status) as api, patch.object(AGENT, "outbound_family") as probe, patch("builtins.input", return_value="n"), patch("builtins.print"):
+                AGENT.configure_default_plans({})
+                api.assert_called_once_with({}, "default-plans")
+                probe.assert_not_called()
+
     def test_prepare_rejects_root_or_mismatched_service_identity_before_filesystem_changes(self):
         config = {"nodeUuid": TASK["taskId"], "role": "node"}
         for uid, gid, expected in [(0, 123, 123), (123, 0, 0), (123, 123, 456)]:

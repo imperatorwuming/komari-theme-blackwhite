@@ -26,6 +26,7 @@ const files = [
   ...["json-state", "native-queue-state", "catalog", "native-model", "native-controller", "globalping", "route-enrichment", "route-evidence", "website-catalog", "round-store", "retention-store", "report-catalog", "report-model", "report-controller", "report-assets", "home-routes", "home-speeds", "report-resources", "report-share", "bgp"].map((name) => [`src/${name}.js`, resolve(plugin, `src/${name}.js`)]),
   ["src/timezones.json", resolve(plugin, "src/timezones.json")],
   ["src/home-diagnostics.js", resolve(plugin, "src/home-diagnostics.js")],
+  ["src/default-plans.js", resolve(plugin, "src/default-plans.js")],
   ["runner/blackwhite-network-observatory-http.service", resolve(root, "network-observatory/runner/blackwhite-network-observatory-http.service")],
   ["runner/http_receiver.py", resolve(root, "network-observatory/runner/http_receiver.py")],
   ["runner/public_speed.py", resolve(root, "network-observatory/runner/public_speed.py")],

@@ -26,6 +26,7 @@ import {
   type HomepagePingTaskBindings,
 } from "@/utils/pingTasks";
 import { isValidPingLatency } from "@/utils/pingSamples";
+import { useHomeRoutes } from "@/hooks/useHomeRoutes";
 
 const DEFAULT_PING_REFRESH_INTERVAL = 60_000;
 const MIN_PING_REFRESH_INTERVAL = 10_000;
@@ -628,17 +629,33 @@ function subscribeToPingItems(uuids: string[], listener: Listener) {
   };
 }
 
+export function useEffectiveHomepagePingBindings(): HomepagePingTaskBindings {
+  const { homepagePingBindings } = useThemeSettings();
+  const automatic = useHomeRoutes().data?.pingBindings;
+  return useMemo(() => {
+    if (!automatic || !Object.keys(automatic).length) return homepagePingBindings;
+    const manualClients = getHomepagePingTaskIdsByClient(homepagePingBindings);
+    const combined = { ...homepagePingBindings };
+    for (const [id, clients] of Object.entries(automatic)) {
+      const managedClients = clients.filter(uuid => !manualClients.has(uuid));
+      if (managedClients.length) combined[id] = [...(combined[id] || []), ...managedClients];
+    }
+    return combined;
+  }, [automatic, homepagePingBindings]);
+}
+
 export function useHomepagePingOverview() {
   const { data: me } = useAuth();
   const visibleUuids = useVisibleNodeUuids(me?.logged_in === true);
   const themeSettings = useThemeSettings();
+  const bindings = useEffectiveHomepagePingBindings();
 
   useEffect(() => {
     if (!themeSettings.isReady) return;
     activeConsumers += 1;
     ensurePingOverviewStarted(
       visibleUuids,
-      themeSettings.homepagePingBindings,
+      bindings,
       themeSettings.homepagePingAggregationStrategy,
       themeSettings.homepagePingPrimaryTasks,
     );
@@ -651,7 +668,7 @@ export function useHomepagePingOverview() {
     };
   }, [
     themeSettings.homepagePingAggregationStrategy,
-    themeSettings.homepagePingBindings,
+    bindings,
     themeSettings.homepagePingPrimaryTasks,
     themeSettings.isReady,
     visibleUuids,

@@ -351,7 +351,7 @@ export const NetworkSummary = memo(function NetworkSummary({
             {routes.data?.display !== false && routePair(carrier, family, name)}
             {settings.showPingChart && (
               <Link className="crystal-quality" to={buildHomepagePingCompareUrl(uuid, [source.taskId])}
-                aria-label={`${name} 质量历史 · 延迟 ${source.latencyLabel} · 丢包 ${source.lossLabel}`}>
+                aria-label={`${name} 质量历史 · 延迟 ${source.latencyLabel} · ${source.name.endsWith(" TCPing") ? "TCP 连接失败率" : "丢包"} ${source.lossLabel}`}>
                 <CrystalQuality source={source} />
                 <CrystalQuality source={source} loss />
               </Link>

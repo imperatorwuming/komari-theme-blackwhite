@@ -414,7 +414,7 @@ export function ReportPlanPanel({
                   {mod.endpoints.some(id => id.startsWith("taier:")) && <>
                     <p className="report-caption">公共测速由 VPS 主动连接，无需大陆自建测量机；严格匹配实际城市/运营商，缺少覆盖会明确记录。第三方协议和节点可能变化；队列串行执行并在繁忙时退避。</p>
                     <label>每测量点应用载荷上限（含所有方向、连接数和预热）<select value={mod.maxTrafficMiB || 1024} onChange={e => moduleChange(mod.module, { maxTrafficMiB: Number(e.target.value) })}>
-                      {[64, 256, 512, 1024, 2048, 4096].map(n => <option value={n} key={n}>{n} MiB</option>)}
+                      {[32, 64, 256, 512, 1024, 2048, 4096].map(n => <option value={n} key={n}>{n} MiB</option>)}
                     </select></label>
                     <p className="report-caption">达到上限提前结束并注明原因；协议开销另计。当前每 VPS 每次最多 {(mod.endpoints.filter(id => id.startsWith("taier:")).length * (mod.maxTrafficMiB || 1024) / 1024).toFixed(1)} GiB 应用载荷。</p>
                   </>}
@@ -545,7 +545,7 @@ export function ReportPlanPanel({
                 }
                 description="各模块独立调度；测速不会随延迟测试的频率触发。"
               />
-              {["tcpquality-full", "nodequality-full"].includes(mod.module) || isDiagnostic(mod.module) ? <FullScheduleEditor key={mod.module} timing={mod.timing} timezones={catalog.timezones} onChange={timing => moduleChange(mod.module, { timing })} /> : <>
+              {["tcpquality-full", "nodequality-full"].includes(mod.module) || isDiagnostic(mod.module) || mod.module.endsWith("speed") ? <FullScheduleEditor key={mod.module} timing={mod.timing} timezones={catalog.timezones} minimumInterval={mod.module.endsWith("speed") ? 1440 : undefined} onChange={timing => moduleChange(mod.module, { timing })} /> : <>
               <label>
                 执行方式
                 <select

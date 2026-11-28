@@ -9,6 +9,7 @@ const B = require("./bgp.js");
 const { originQuery } = require("./route-enrichment.js");
 const { DIAGNOSTICS, SECTIONS, homeDiagnosticsStore } = require("./home-diagnostics.js");
 const { routeFacts, restoreRouteFacts } = require("./route-evidence.js");
+const defaults = require("./default-plans.js");
 const BASE = "/api/blackwhite-network-observatory/v3";
 const MAX_QUEUE = 10000;
 const measurementKey = (j) =>
@@ -127,6 +128,34 @@ function registerReportController(ctx, native) {
     s.reportResources ||= [];
     s.reportDispatch ||= [];
     return s;
+  }
+  function defaultSetup(s, uuid, input) {
+    if (input) {
+      if (!s.inventory.some(node => node.uuid === uuid)) throw new Error("Komari 尚未同步此节点，请稍后重试");
+      if (defaults.enroll(state(s), uuid, defaults.validateSelection(input))) native.save(s);
+    }
+    const setup = s.defaultEnrollments?.[uuid];
+    return { ...defaults.describe(), enrolled: !!setup, firstPending: !!setup?.firstPlans.length };
+  }
+  async function syncDefaultPings() {
+    const enrollments = await native.lock(() => {
+      const pending = native.read().defaultEnrollments;
+      return pending && Object.values(pending).some(value => value.pingPending)
+        ? JSON.parse(JSON.stringify(pending)) : null;
+    });
+    if (!enrollments) return;
+    try {
+      const bindings = await defaults.syncPings((method, params) =>
+        params ? ctx.server.call(method, params) : ctx.server.call(method), enrollments);
+      await native.lock(() => {
+        const s = native.read();
+        s.defaultPingBindings = bindings;
+        for (const uuid of Object.keys(enrollments)) s.defaultEnrollments[uuid].pingPending = false;
+        native.save(s);
+      });
+    } catch (error) {
+      console.error("Blackwhite 默认 TCPing 配置:", String(error.message || error));
+    }
   }
   function members(suite, s) {
     const clients = new Set(suite.clients), groups = new Set(suite.groups);
@@ -320,7 +349,8 @@ function registerReportController(ctx, native) {
           j.reportModule === mod.module,
       );
     const recordOverlap = ["tcpquality-full", "nodequality-full", ...DIAGNOSTICS].includes(mod.module);
-    const competing = recordOverlap && s.jobs.some(j => j.nodeUuid === nodeUuid && j.reportModule === mod.module);
+    const competing = recordOverlap && s.jobs.some(j => j.nodeUuid === nodeUuid && j.reportModule === mod.module &&
+      (!DIAGNOSTICS.includes(mod.module) || mod.family === "auto" || mod.family === j.options?.family));
     if (pending.length && pending.some(j => j.roundId === stableId)) return stableId;
     if (pending.length && !recordOverlap) return scheduled && pending.some(j => j.expiresAt <= Date.now()) ? false : null;
     if (competing && !scheduled) return null;
@@ -599,7 +629,13 @@ function registerReportController(ctx, native) {
       rows.map(row => ({ ...row, forward: row.forward ? { ...row.forward, diagnostic: "" } : null,
         return: row.return ? { ...row.return, diagnostic: "" } : null }))]));
     const configured = cardFamilies(s, "routes");
+    const visible = new Set(uuids), pingBindings = {};
+    for (const [id, clients] of Object.entries(s.defaultPingBindings || {})) {
+      const allowed = clients.filter(uuid => visible.has(uuid));
+      if (allowed.length) pingBindings[id] = allowed;
+    }
     return { available: true, configuredFamilies: Object.fromEntries(uuids.map(id => [id, configured[id] || []])), nodes, access: admin ? "admin" : "public",
+      pingBindings,
       backfillPending: admin && uuids.some(uuid => routeHistoryQueue.has(uuid)),
       labelMode: s.homeRouteLabelMode || "preferred", showDetails: s.homeRouteShowDetails === true,
       published: uuids.filter(id => (s.homeRouteNodes || []).includes(id)), display: s.homeRouteDisplay !== false,
@@ -611,8 +647,12 @@ function registerReportController(ctx, native) {
     if (s.homeRouteProjectionVersion !== 3) {
       rebuildHomeRoutes(ids);
     }
+    const diagnosticNodes = { ...s.homeDiagnosticNodes };
+    const enrolled = Object.keys(s.defaultEnrollments || {});
+    for (const section of DIAGNOSTICS)
+      diagnosticNodes[section] = [...new Set([...(diagnosticNodes[section] || []), ...enrolled])];
     ctx.respond(res, 200, { ...homePayload(s, ids, true), quickCheck: true, quickFamilies: cardFamilies(s, "routes"),
-      diagnostics: homeDiagnostics.summary(s.homeDiagnosticNodes, s.workers, new Set(ids), s.homeDiagnosticDisplay) });
+      diagnostics: homeDiagnostics.summary(diagnosticNodes, s.workers, new Set(ids), s.homeDiagnosticDisplay) });
   });
   route("POST", "/home-routes/rebuild", (_req, res, s) => {
     rebuildHomeRoutes(s.inventory.map(n => n.uuid), true);
@@ -1150,6 +1190,21 @@ function registerReportController(ctx, native) {
       });
       recovered = true;
     }
+    const onlineFirst = s.inventory.filter(node =>
+      s.defaultEnrollments?.[node.uuid]?.firstPlans.length && native.online(s, "node:" + node.uuid));
+    if (onlineFirst.length) {
+      for (const suite of s.reportSuites.filter(plan => plan.enabled)) {
+        const nodes = onlineFirst.filter(node => suite.clients.includes(node.uuid) &&
+          s.defaultEnrollments[node.uuid].firstPlans.includes(suite.id)).map(node => node.uuid);
+        if (!nodes.length) continue;
+        for (const mod of suite.modules.filter(value => value.enabled && value.nextAt > now)) {
+          s.reportDispatch.push({ suiteId: suite.id, module: mod.module, batchId: crypto.randomUUID(),
+            plannedAt: now + (mod.module === "china-speed" ? 60000 : 0), nodes, cursor: 0 });
+        }
+      }
+      for (const node of onlineFirst) s.defaultEnrollments[node.uuid].firstPlans = [];
+      changed = true;
+    }
     for (const suite of s.reportSuites.filter((p) => p.enabled))
       for (const mod of suite.modules.filter(
         (m) => m.enabled && m.nextAt <= now,
@@ -1276,7 +1331,7 @@ function registerReportController(ctx, native) {
     receipt: store.receipt,
     acceptLateFull: store.acceptLateFull,
     updateFullReportUrl: store.updateFullReportUrl,
-    capabilities,
+    capabilities, defaultSetup, syncDefaultPings,
   };
 }
 module.exports = { registerReportController, BASE, MAX_QUEUE };

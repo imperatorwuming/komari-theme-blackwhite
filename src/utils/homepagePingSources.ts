@@ -95,7 +95,8 @@ function sourceTitle(row: {
         : row.status === "empty"
           ? "暂无样本"
           : "正常";
-  return `${row.name}${meta ? ` · ${meta}` : ""} · ${row.latencyLabel} · ${HOMEPAGE_PING_WINDOW_LABEL}丢包 ${row.lossLabel} · ${status}`;
+  const lossMetric = row.name.endsWith(" TCPing") ? "TCP 连接失败率" : "丢包";
+  return `${row.name}${meta ? ` · ${meta}` : ""} · ${row.latencyLabel} · ${HOMEPAGE_PING_WINDOW_LABEL}${lossMetric} ${row.lossLabel} · ${status}`;
 }
 
 export function buildHomepagePingSourceRows(

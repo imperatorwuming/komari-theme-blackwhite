@@ -23,7 +23,7 @@ function offset(zone, now) {
   return value;
 }
 const FULL_KINDS = ["tcpquality-full", "nodequality-full"];
-const RULE_KINDS = [...FULL_KINDS, ...DIAGNOSTICS];
+const RULE_KINDS = [...FULL_KINDS, ...DIAGNOSTICS, "speed"];
 function timing(input, kind, inRules = false) {
   if (input?.type === "rules") {
     if (inRules || !RULE_KINDS.includes(kind) || !Array.isArray(input.rules) || input.rules.length < 1 || input.rules.length > 8)

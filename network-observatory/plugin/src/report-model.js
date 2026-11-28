@@ -129,6 +129,7 @@ function normalizeSuite(input, resources = []) {
       seconds,
       warmupSeconds,
       streams, samples, packetSizes, maxTrafficMiB,
+      ...(speed && value.splitSpeedBudget === true ? { splitSpeedBudget: true } : {}),
       ...(value.module === "tcpquality-full" ? { profile, timeoutMinutes } : {}),
       ...(value.module === "nodequality-full" ? { checks, timeoutMinutes, hardwareMode, networkMode } : {}),
       timing,
@@ -371,6 +372,7 @@ function planSlots(s, suite, module, nodeUuid, roundId) {
         warmupSeconds: module.warmupSeconds,
         streams: module.streams,
         maxTrafficMiB: module.maxTrafficMiB || 1024, city: pair.city, carrier: pair.carrier,
+        ...(module.splitSpeedBudget ? { splitSpeedBudget: true } : {}),
         port: e?.port || endpoint?.port || 25201,
       };
       if (e) {

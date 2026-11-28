@@ -6,11 +6,20 @@ async function runControllerScenario() {
   if (scheduleModel.next(schedule, Date.parse("2026-10-28T00:00:00Z")) !== Date.parse("2026-10-28T01:00:00Z") || scheduleModel.next(schedule, Date.parse("2026-10-28T01:00:00Z")) !== Date.parse("2026-10-28T02:00:00Z")) throw new Error("Runtime combined schedule calculation failed");
   var A = "c388e74d-a922-4ae1-bd10-1fb30e2e53de",
     token = "a".repeat(64),
-    routes = new Map();
+    routes = new Map(), pings = [];
   var ctx = {
     server: {
       route: (method, url, handler) => routes.set(method + " " + url, handler),
-      call: async () => [{ uuid: A, name: "runtime test", ipv4: "8.8.8.8" }],
+      call: async (method, params) => {
+        if (method === "admin:listClients") return [{ uuid: A, name: "runtime test", ipv4: "8.8.8.8" }];
+        if (method === "admin:getAllPingTasks") return pings;
+        if (method === "admin:addPingTask") {
+          var id = pings.length + 1;
+          pings.push({ ...params, id });
+          return { task_id: id };
+        }
+        throw new Error("Unexpected runtime RPC " + method);
+      },
     },
     storageDir: __storageDir__,
     isMissingFile,
@@ -103,5 +112,13 @@ async function runControllerScenario() {
   console.log(
     "Official Komari runtime: report routes, shared recovery and async BGP scheduler passed",
   );
+  var setup = await invoke("POST", v2 + "/workers/node/" + A + "/default-plans", {
+    families: ["4", "6"], speedFamilies: ["6"], runNow: false,
+  });
+  await restarted.roundController.syncDefaultPings();
+  var home = await invoke("GET", v3 + "/home-routes");
+  if (!setup.enrolled || pings.length !== 18 || Object.keys(home.pingBindings).length !== 18)
+    throw new Error("Runtime default enrollment did not finish");
+  console.log("Official Komari runtime: dual-stack defaults and native TCPing enrollment passed");
   return true;
 }

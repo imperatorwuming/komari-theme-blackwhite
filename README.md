@@ -4,7 +4,7 @@
 
 komari-theme-blackwhite 是 Komari 的服务器监控和资产管理主题。**晶透·亮色**与**晶透·暗色**共用同一套功能，包括节点巡检、负载与流量趋势、多 VPS 对比、资产与续费统计、网络观测和报告导出。
 
-**当前版本 v1.0.0** · [下载 ZIP 和安装脚本](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) · [安装主题](#安装主题) · [配置网络观测](network-observatory/README.md) · [后端兼容性](COMPATIBILITY.md)
+**当前版本 v1.1.0** · [下载 ZIP 和安装脚本](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) · [安装主题](#安装主题) · [配置网络观测](network-observatory/README.md) · [后端兼容性](COMPATIBILITY.md)
 
 | 晶透·亮色 | 晶透·暗色 |
 | --- | --- |
@@ -13,7 +13,7 @@ komari-theme-blackwhite 是 Komari 的服务器监控和资产管理主题。**�
 ## 安装主题
 
 1. 先部署 [Komari 服务端](https://www.komari.wiki/) 并登录后台。如果侧栏是英文，Theme Management 对应「主题管理」。要看到 CPU、内存、在线状态等基本数据，请先在「服务器列表」添加至少一个服务器，按后台生成的命令安装官方 [Komari Agent](https://github.com/komari-monitor/komari-agent)，等服务器显示在线。
-2. 从 [v1.0.0 的 Assets](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) 下载 **`komari-theme-blackwhite-v1.0.0.zip`**。
+2. 从 [v1.1.0 的 Assets](https://github.com/imperatorwuming/komari-theme-blackwhite/releases/latest) 下载 **`komari-theme-blackwhite-v1.1.0.zip`**。
 3. 在后台打开 **主题 → 主题管理 → 上传主题**，选择 ZIP，页面会自动上传。直接上传完整 ZIP，解包后上传会缺少安装清单。Release 页面的自动生成源码包也无法安装。
 4. 在已安装列表中找到 **komari-theme-blackwhite**，将其设为当前主题。点击左下角「主页」验证，已有节点和历史数据仍由同一个 Komari 服务端提供。
 
@@ -42,7 +42,7 @@ komari-theme-blackwhite 是 Komari 的服务器监控和资产管理主题。**�
 
 ## 接入网络观测
 
-基本监控和 Komari 原生 Ping 可直接使用。要在首页和实例查看三网去回程、上下行测速、IP 质量、流媒体和 AI 解锁，以及 TcpQuality / NodeQuality 完整报告，请依次安装 **Blackwhite 网络观测插件**、在参与检测的 VPS 上安装 **Blackwhite 探测器**、创建检测方案并验证一轮。主题、插件和探测器的项目版本均为 **1.0.0**。
+基本监控和 Komari 原生 Ping 可直接使用。安装 **Blackwhite 网络观测插件**和 **Blackwhite 探测器**后，可在探测器安装向导加入默认方案。插件按 VPS 实际可用的地址族安排三网线路、京沪穗 TCPing、IP 质量及流媒体和 AI 解锁，测速单独确认。手工方案和 TcpQuality／NodeQuality 完整报告仍可在工作室管理。主题、插件和探测器版本均为 **1.1.0**。
 
 ![网络观测工作室与探测器入口](docs/images/network-overview.jpg)
 
